@@ -163,6 +163,7 @@ type wxcliConfig struct {
 
 func runScan(args []string, doSetup bool) {
 	f := parseFlags(args)
+	requireSIPDisabled(f.quiet)
 	pid := f.pid
 	if pid == 0 {
 		p, err := pickWeChatPID()
@@ -446,6 +447,64 @@ func isPermissionErr(err error) bool {
 		(strings.Contains(msg, "kr=5") || strings.Contains(msg, "kr=4"))
 }
 
+// sipDisabled parses `csrutil status`. Returns disabled=true only if csrutil
+// runs cleanly AND output explicitly says disabled. Indeterminate cases
+// (csrutil missing / output unparseable) return (false, "") so the caller
+// knows to skip the soft block — we'd rather let the real task_for_pid
+// syscall fail loudly than risk a false-positive prompt to disable SIP.
+func sipDisabled() (disabled bool, raw string) {
+	out, err := exec.Command("/usr/bin/csrutil", "status").CombinedOutput()
+	if err != nil {
+		return false, ""
+	}
+	raw = strings.TrimSpace(string(out))
+	low := strings.ToLower(raw)
+	if strings.Contains(low, "disabled") {
+		return true, raw
+	}
+	if strings.Contains(low, "enabled") {
+		return false, raw
+	}
+	return false, ""
+}
+
+// requireSIPDisabled is a soft pre-flight check called at the entry of any
+// command that needs task_for_pid (scan / setup / doctor). When SIP is on,
+// it prints a Chinese-language error explaining why and how to fix, then
+// exits non-zero before we ever touch the kernel. Set WXKEY_SKIP_SIP_CHECK=1
+// to bypass (e.g. if you signed wxkey with a debugger entitlement).
+func requireSIPDisabled(quiet bool) {
+	if os.Getenv("WXKEY_SKIP_SIP_CHECK") == "1" {
+		return
+	}
+	disabled, raw := sipDisabled()
+	if disabled {
+		return
+	}
+	if raw == "" {
+		// csrutil unavailable or unparseable — let downstream syscall error speak.
+		return
+	}
+	if quiet {
+		fmt.Fprintf(os.Stderr, "wxkey: SIP enabled, task_for_pid will fail. Disable SIP via Recovery Mode → `csrutil disable`. Raw: %s\n", raw)
+		os.Exit(2)
+	}
+	fmt.Fprintln(os.Stderr, "[FAIL] SIP (System Integrity Protection) 当前为启用状态")
+	fmt.Fprintln(os.Stderr, "       wxkey 需要 task_for_pid 读微信进程内存, SIP 启用时 macOS 内核硬性拒绝.")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "       关闭步骤 (Apple Silicon):")
+	fmt.Fprintln(os.Stderr, "         1. 关机, 长按电源键进 Recovery Mode")
+	fmt.Fprintln(os.Stderr, "         2. 顶部菜单 Utilities → Terminal")
+	fmt.Fprintln(os.Stderr, "         3. 跑: csrutil disable")
+	fmt.Fprintln(os.Stderr, "         4. 重启回常规系统")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "       关完再跑: ./wxkey doctor  验证")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintf(os.Stderr, "       csrutil 原始输出: %s\n", raw)
+	fmt.Fprintln(os.Stderr, "       (若你已自签 debugger entitlement, 设 WXKEY_SKIP_SIP_CHECK=1 跳过本预检)")
+	os.Exit(2)
+}
+
 // reExecElevated re-launches this binary under osascript with administrator
 // privileges, blocking until it exits, and forwards stdout/stderr.
 func reExecElevated() error {
@@ -505,6 +564,17 @@ func runDoctor(args []string) {
 	}
 
 	logf("=== wxkey doctor ===\n")
+
+	if disabled, raw := sipDisabled(); !disabled && raw != "" {
+		logf("[FAIL] SIP 启用 — wxkey 需要 SIP 关闭才能扫内存\n")
+		logf("       关法: Recovery Mode → Terminal → csrutil disable → 重启\n")
+		logf("       原始: %s\n", raw)
+		os.Exit(1)
+	} else if disabled {
+		logf("[OK]   SIP 已关闭\n")
+	} else {
+		logf("[INFO] csrutil 不可用, 跳过 SIP 预检\n")
+	}
 
 	pids, _ := wechatPIDs()
 	if len(pids) == 0 {
