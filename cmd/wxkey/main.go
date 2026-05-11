@@ -1,8 +1,7 @@
 // wxkey extracts WeChat 4.x WCDB master keys from the live WeChat process on
-// macOS. Pure Go (purego + Mach VM syscalls). Replaces the WeFlow xkey_helper
-// dependency by passively scanning WeChat's heap for the SQL literal
-// `x'<hex>'` that WCDB constructs when forwarding keys to sqlite3_key_v2,
-// then verifying each candidate via SQLCipher 4 page-1 HMAC.
+// macOS. Pure Go (purego + Mach VM syscalls). Passively scans WeChat's heap
+// for the SQL literal `x'<hex>'` that WCDB constructs when forwarding keys to
+// sqlite3_key_v2, then verifies each candidate via SQLCipher 4 page-1 HMAC.
 package main
 
 import (
@@ -165,8 +164,8 @@ type setupOutput struct {
 // avoiding the 256000-round PBKDF2 on every DB open.
 //
 // "key" (legacy) is the user-supplied master password — kept on
-// re-runs only if it was already there (set via the WeFlow path) so older
-// wx-mcp builds keep working until they ship the new code.
+// re-runs only if it was already there, so older wx-mcp builds keep working
+// until they ship the new code.
 type wxcliConfig struct {
 	SchemaVersion int               `json:"schema_version"`
 	WxID          string            `json:"wxid"`
@@ -215,7 +214,7 @@ func runScan(args []string, doSetup bool) {
 		if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
 			logf(f.quiet, "[wxkey] task_for_pid denied; re-launching via osascript admin...\n")
 			if reErr := reExecElevated(); reErr != nil {
-				fail("re-elevate: %v (original error: %v)", reErr, err)
+				fail("%s", buildElevateFailHint(reErr, err))
 			}
 			return // child handled it
 		}
@@ -550,7 +549,7 @@ func pickAccountRoot() (string, error) {
 		}
 	}
 	if len(cands) == 0 {
-		return "", fmt.Errorf("no WeChat account directory found under known roots")
+		return "", buildNoAccountDirError(roots)
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].mtime > cands[j].mtime })
 	return cands[0].path, nil
@@ -626,6 +625,74 @@ func isPermissionErr(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "task_for_pid") &&
 		(strings.Contains(msg, "kr=5") || strings.Contains(msg, "kr=4"))
+}
+
+// buildElevateFailHint composes an actionable hint when osascript-based
+// auto-elevation fails (e.g. user cancelled the password dialog, SSH session
+// with no GUI, or the dialog never surfaced because wxkey was launched from
+// a non-interactive AI agent shell).
+func buildElevateFailHint(reErr, origErr error) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "auto-elevate via osascript failed: %v\n", reErr)
+	fmt.Fprintf(&b, "       original permission error: %v\n", origErr)
+	fmt.Fprintln(&b, "")
+	if os.Getenv("SSH_CONNECTION") != "" || os.Getenv("SSH_CLIENT") != "" || os.Getenv("SSH_TTY") != "" {
+		fmt.Fprintln(&b, "       You appear to be on SSH. osascript needs a desktop GUI session to")
+		fmt.Fprintln(&b, "       show the macOS password prompt. Options:")
+		fmt.Fprintln(&b, "         a) Run `wxkey bootstrap` on the Mac's local desktop (no sudo).")
+		fmt.Fprintln(&b, "         b) Over SSH, run `sudo wxkey bootstrap` in your interactive shell")
+		fmt.Fprintln(&b, "            (sudo needs a real tty; AI agents / pipes will not work).")
+	} else {
+		fmt.Fprintln(&b, "       The macOS password prompt may have been cancelled or never surfaced.")
+		fmt.Fprintln(&b, "       Re-run `wxkey bootstrap` directly on the Mac's desktop (do NOT add")
+		fmt.Fprintln(&b, "       sudo, and do NOT pipe it through an AI agent / non-interactive shell;")
+		fmt.Fprintln(&b, "       both prevent the password dialog from working). When the macOS dialog")
+		fmt.Fprintln(&b, "       appears, type your admin password to grant task_for_pid access.")
+	}
+	return b.String()
+}
+
+// buildNoAccountDirError lists each scanned root and the subdirectories
+// observed, marking why each was skipped, so the user can see whether their
+// account dir is missing entirely (WeChat not installed/logged in) or merely
+// missing db_storage/ (logged in but never synced messages).
+func buildNoAccountDirError(roots []string) error {
+	var b strings.Builder
+	fmt.Fprintln(&b, "no WeChat 4.x account directory with db_storage/ found.")
+	for _, root := range roots {
+		fmt.Fprintf(&b, "       scanned: %s\n", root)
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			fmt.Fprintf(&b, "         (read failed: %v)\n", err)
+			continue
+		}
+		anyDir := false
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			anyDir = true
+			name := e.Name()
+			if isBoringDir(name) {
+				fmt.Fprintf(&b, "         %s/   (skipped: not an account dir)\n", name)
+				continue
+			}
+			dbStore := filepath.Join(root, name, "db_storage")
+			if _, err := os.Stat(dbStore); err != nil {
+				fmt.Fprintf(&b, "         %s/   (no db_storage/ subdirectory yet)\n", name)
+			} else {
+				fmt.Fprintf(&b, "         %s/   (has db_storage but not picked — please file a bug)\n", name)
+			}
+		}
+		if !anyDir {
+			fmt.Fprintln(&b, "         (empty)")
+		}
+	}
+	fmt.Fprintln(&b, "")
+	fmt.Fprintln(&b, "       Hint: open WeChat 4.x, finish login, then send or receive at least one")
+	fmt.Fprintln(&b, "       message. WeChat creates db_storage/ only after the first DB write. Then")
+	fmt.Fprintln(&b, "       re-run `wxkey bootstrap`.")
+	return fmt.Errorf("%s", b.String())
 }
 
 const wechatAppPath = "/Applications/WeChat.app"
@@ -987,11 +1054,8 @@ func findBundledDylib() string {
 	}
 	home := effectiveUserHome()
 	candidates = append(candidates,
-		filepath.Join(home, "cc-workspace", "mcp-servers", "wx-mcp", "lib", "libWCDB.dylib"),
 		filepath.Join(home, ".config", "wxcli", "lib", "libWCDB.dylib"),
 	)
-	candidates = append(candidates,
-		"/Applications/WeFlow.app/Contents/Resources/resources/wcdb/macos/universal/libWCDB.dylib")
 	for _, p := range candidates {
 		if _, err := os.Stat(p); err == nil {
 			return p

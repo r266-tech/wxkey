@@ -12,8 +12,8 @@
 //	enc_key = PBKDF2-HMAC-SHA512(password, salt,           iter=KDFIter, dklen=32)
 //	mac_key = PBKDF2-HMAC-SHA512(enc_key,  salt XOR 0x3A,  iter=2,       dklen=32)
 //
-// `password` is what callers pass to sqlite3_key_v2. When wx-mcp / WeFlow stash
-// the 64-hex "key" in their config, that hex is the password (NOT the post-KDF
+// `password` is what callers pass to sqlite3_key_v2. When wx-mcp stashes the
+// 64-hex "key" in its config, that hex is the password (NOT the post-KDF
 // enc_key) — WCDB still runs the 256000-round PBKDF2 internally on each open.
 //
 // Memory may hold the candidate as either the password or the enc_key,
