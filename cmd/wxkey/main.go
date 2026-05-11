@@ -24,13 +24,18 @@ import (
 const usage = `wxkey - extract WeChat 4.x WCDB master keys (macOS)
 
 Usage:
+  wxkey bootstrap  [--root /path/to/xwechat_files/<wxid>] [--config ~/.config/wxcli/config.json]
   wxkey scan       [--pid N] [--root /path/to/xwechat_files/<wxid>] [--quiet]
   wxkey setup      [--pid N] [--root ...] [--config ~/.config/wxcli/config.json]
   wxkey doctor     [--pid N] [--root ...] [--quiet]
+  wxkey resign-wechat
   wxkey list-pids
   wxkey -h | --help
 
 Subcommands:
+  bootstrap   One-command first-run setup for humans/agents: checks existing
+              config, ad-hoc re-signs WeChat when needed, runs setup, and only
+              prints a summary (not key material).
   scan        Scan WeChat memory and print JSON: {pid, root, stats, results[]}.
               results[] entries map a DB salt to its 64-hex master key.
   setup       Like scan, but also writes ~/.config/wxcli/config.json so wx-mcp
@@ -41,13 +46,19 @@ Subcommands:
               (which DBs have keys in heap vs which are missing). Auto-elevates
               for the actual memory scan. Run this first if mcp/wxkey behaves
               unexpectedly — it tells you what's missing without writing config.
+  resign-wechat
+              Apply the recommended no-SIP route: quit WeChat, ad-hoc re-sign
+              /Applications/WeChat.app, then reopen it. Run once after each
+              WeChat update if task_for_pid is denied.
   list-pids   Print one WeChat PID per line (or empty if not running).
 
 Notes:
   - WeChat must be running and have opened at least one DB this session.
-  - task_for_pid requires SIP-disabled + admin grant. wxkey will re-launch
-    itself via osascript if the direct attach fails (set WXKEY_NO_ELEVATE=1
-    to disable that auto-relaunch).
+  - wx-mcp runtime DB decryption does not require SIP-disabled. First-time key
+    extraction only needs a readable WeChat task port: ad-hoc-signed WeChat +
+    admin privileges is the recommended route; SIP-disabled is only a fallback.
+  - wxkey will re-launch itself via osascript if the direct attach fails (set
+    WXKEY_NO_ELEVATE=1 to disable that auto-relaunch).
 `
 
 func main() {
@@ -59,12 +70,16 @@ func main() {
 	switch os.Args[1] {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
+	case "bootstrap":
+		runBootstrap(os.Args[2:])
 	case "scan":
 		runScan(os.Args[2:], false)
 	case "setup":
 		runScan(os.Args[2:], true)
 	case "doctor":
 		runDoctor(os.Args[2:])
+	case "resign-wechat":
+		runResignWeChat()
 	case "list-pids":
 		runListPids()
 	default:
@@ -75,10 +90,10 @@ func main() {
 }
 
 type scanFlags struct {
-	pid           int
-	root          string
-	quiet         bool
-	config        string
+	pid            int
+	root           string
+	quiet          bool
+	config         string
 	includeBareHex bool
 }
 
@@ -131,10 +146,10 @@ func parseFlags(args []string) scanFlags {
 }
 
 type scanOutput struct {
-	PID     int          `json:"pid"`
-	Root    string       `json:"scan_root"`
-	WxID    string       `json:"wxid"`
-	Stats   scan.Stats   `json:"stats"`
+	PID     int           `json:"pid"`
+	Root    string        `json:"scan_root"`
+	WxID    string        `json:"wxid"`
+	Stats   scan.Stats    `json:"stats"`
 	Results []scan.Result `json:"results"`
 }
 
@@ -163,7 +178,6 @@ type wxcliConfig struct {
 
 func runScan(args []string, doSetup bool) {
 	f := parseFlags(args)
-	requireSIPDisabled(f.quiet)
 	pid := f.pid
 	if pid == 0 {
 		p, err := pickWeChatPID()
@@ -205,6 +219,9 @@ func runScan(args []string, doSetup bool) {
 			}
 			return // child handled it
 		}
+		if isPermissionErr(err) {
+			printPermissionAdvice(f.quiet, err)
+		}
 		fail("scan: %v", err)
 	}
 
@@ -229,12 +246,12 @@ func runScan(args []string, doSetup bool) {
 
 	cfgPath := f.config
 	if cfgPath == "" {
-		home, _ := os.UserHomeDir()
-		cfgPath = filepath.Join(home, ".config", "wxcli", "config.json")
+		cfgPath = defaultConfigPath()
 	}
 	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
 		fail("mkdir config dir: %v", err)
 	}
+	chownToInvokingUser(filepath.Dir(cfgPath))
 
 	// Preserve any existing legacy "key" field so older wx-mcp builds keep
 	// working until V upgrades. We don't carry over old "keys" map — the
@@ -265,6 +282,7 @@ func runScan(args []string, doSetup bool) {
 	if err := os.WriteFile(cfgPath, data, 0o600); err != nil {
 		fail("write config: %v", err)
 	}
+	chownToInvokingUser(cfgPath)
 	chownToDirOwner(cfgPath)
 	if len(out.Results) < len(saltIdx) {
 		fmt.Fprintf(os.Stderr, "[wxkey] WARNING: 部分 key 缺失 (%d/%d). 跑 `sudo wxkey doctor` 看哪些 DB 没拿到 key, 通常是因为还没在 WeChat 里打开过那个聊天。\n",
@@ -283,7 +301,170 @@ func runListPids() {
 	}
 }
 
+func runBootstrap(args []string) {
+	f := parseFlags(args)
+	cfgPath := f.config
+	if cfgPath == "" {
+		cfgPath = defaultConfigPath()
+	}
+	if cfg, ok := configReady(cfgPath); ok {
+		fmt.Println("=== wxkey bootstrap ===")
+		fmt.Printf("[OK] key config already exists: %s\n", cfgPath)
+		fmt.Printf("     wxid=%s db_root=%s keys=%d\n", cfg.WxID, cfg.DBRoot, len(cfg.Keys))
+		fmt.Println("     wx-mcp can start now; no SIP change needed.")
+		return
+	}
+
+	fmt.Println("=== wxkey bootstrap ===")
+	fmt.Println("[INFO] Goal: prepare ~/.config/wxcli/config.json without requiring SIP-disabled.")
+
+	if _, err := os.Stat(wechatAppPath); err != nil {
+		fail("WeChat app not found at %s: %v", wechatAppPath, err)
+	}
+
+	sig := inspectWeChatSignature()
+	if sig.Err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] WeChat signature check failed: %v\n", sig.Err)
+		if sig.Raw != "" {
+			fmt.Fprintf(os.Stderr, "       codesign output: %s\n", sig.Raw)
+		}
+	} else if sig.Runtime && !sig.AdHoc {
+		fmt.Println("[INFO] WeChat has official Hardened Runtime; applying recommended no-SIP resign route.")
+		if err := runSelfPassthrough("resign-wechat"); err != nil {
+			fail("resign-wechat failed: %v", err)
+		}
+	} else if sig.AdHoc {
+		fmt.Println("[OK]   WeChat is already ad-hoc signed.")
+	} else {
+		fmt.Println("[INFO] WeChat signature state is not recognized; trying setup directly.")
+	}
+
+	if err := ensureWeChatReady(f.root, 90*time.Second); err != nil {
+		fail("%v", err)
+	}
+
+	fmt.Println("[INFO] Extracting keys and writing config...")
+	res, err := runSetupCaptured(f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[wxkey] setup failed during bootstrap.\n")
+		fmt.Fprintf(os.Stderr, "        If WeChat just reopened, wait until it is fully logged in, open one chat, then rerun `wxkey bootstrap`.\n")
+		fail("%v", err)
+	}
+
+	fmt.Println("[OK]   key config written")
+	fmt.Printf("       config: %s\n", res.ConfigPath)
+	fmt.Printf("       wxid: %s\n", res.WxID)
+	fmt.Printf("       db_root: %s\n", res.Root)
+	fmt.Printf("       keys: %d\n", len(res.Results))
+	fmt.Println("")
+	fmt.Println("Done. Register/start wx-mcp now; runtime DB decryption does not require SIP-disabled.")
+}
+
 // --- helpers ---
+
+func defaultConfigPath() string {
+	return filepath.Join(effectiveUserHome(), ".config", "wxcli", "config.json")
+}
+
+func configReady(path string) (wxcliConfig, bool) {
+	var cfg wxcliConfig
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, false
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, false
+	}
+	return cfg, cfg.DBRoot != "" && len(cfg.Keys) > 0
+}
+
+func runSelfPassthrough(args ...string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
+func ensureWeChatReady(root string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	if pids, _ := wechatPIDs(); len(pids) == 0 {
+		fmt.Println("[INFO] Opening WeChat...")
+		_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
+	}
+	for {
+		if _, err := pickWeChatPID(); err == nil {
+			if root != "" {
+				if st, statErr := os.Stat(root); statErr == nil && st.IsDir() {
+					return nil
+				}
+			} else if _, err := pickAccountRoot(); err == nil {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("WeChat is not ready yet; open WeChat, finish login, open one chat, then rerun `wxkey bootstrap`")
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func runSetupCaptured(f scanFlags) (*setupOutput, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"setup", "--quiet"}
+	if f.pid > 0 {
+		args = append(args, "--pid", strconv.Itoa(f.pid))
+	}
+	if f.root != "" {
+		args = append(args, "--root", f.root)
+	}
+	if f.config != "" {
+		args = append(args, "--config", f.config)
+	}
+	cmd := exec.Command(exe, args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("setup command failed: %w\n%s", err, msg)
+		}
+		return nil, fmt.Errorf("setup command failed: %w", err)
+	}
+	payload := string(out)
+	if i := strings.IndexByte(payload, '{'); i >= 0 {
+		payload = payload[i:]
+	}
+	var res setupOutput
+	if err := json.Unmarshal([]byte(payload), &res); err != nil {
+		return nil, fmt.Errorf("parse setup output: %w (stdout %d bytes)", err, len(out))
+	}
+	return &res, nil
+}
+
+func effectiveUserHome() string {
+	if u := strings.TrimSpace(os.Getenv("SUDO_USER")); u != "" && u != "root" {
+		return filepath.Join("/Users", u)
+	}
+	if os.Geteuid() == 0 {
+		if out, err := exec.Command("/usr/bin/stat", "-f", "%Su", "/dev/console").Output(); err == nil {
+			u := strings.TrimSpace(string(out))
+			if u != "" && u != "root" && u != "loginwindow" {
+				return filepath.Join("/Users", u)
+			}
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return home
+}
 
 func wechatPIDs() ([]int, error) {
 	out, err := exec.Command("/usr/bin/pgrep", "-x", "WeChat").Output()
@@ -329,7 +510,7 @@ func pickWeChatPID() (int, error) {
 // known WeChat 4.x storage roots. Returns the directory whose db_storage
 // has the most recently-modified file (i.e., the live account).
 func pickAccountRoot() (string, error) {
-	home, _ := os.UserHomeDir()
+	home := effectiveUserHome()
 	roots := []string{
 		filepath.Join(home, "Library", "Containers", "com.tencent.xinWeChat", "Data", "Documents", "xwechat_files"),
 	}
@@ -447,6 +628,74 @@ func isPermissionErr(err error) bool {
 		(strings.Contains(msg, "kr=5") || strings.Contains(msg, "kr=4"))
 }
 
+const wechatAppPath = "/Applications/WeChat.app"
+
+type wechatSignatureStatus struct {
+	Raw     string
+	AdHoc   bool
+	Runtime bool
+	Err     error
+}
+
+func classifyWeChatSignature(raw string) wechatSignatureStatus {
+	low := strings.ToLower(raw)
+	return wechatSignatureStatus{
+		Raw:     strings.TrimSpace(raw),
+		AdHoc:   strings.Contains(low, "signature=adhoc") || strings.Contains(low, "(adhoc)"),
+		Runtime: strings.Contains(low, "(runtime)") || strings.Contains(low, "flags=0x10000"),
+	}
+}
+
+func inspectWeChatSignature() wechatSignatureStatus {
+	out, err := exec.Command("/usr/bin/codesign", "-dv", wechatAppPath).CombinedOutput()
+	st := classifyWeChatSignature(string(out))
+	st.Err = err
+	return st
+}
+
+func printPermissionAdvice(quiet bool, original error) {
+	if quiet {
+		fmt.Fprintln(os.Stderr, "wxkey: task_for_pid denied. Run `wxkey doctor` for details or `wxkey resign-wechat` to use the no-SIP setup route.")
+		return
+	}
+
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "[FAIL] task_for_pid 被拒, 暂时无法读取 WeChat 进程内存拿 key.")
+	if original != nil {
+		fmt.Fprintf(os.Stderr, "       原始错误: %v\n", original)
+	}
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "       wx-mcp 的运行时解密不需要关闭 SIP; 只有首次取 key 需要读取 WeChat 进程内存.")
+
+	if disabled, raw := sipDisabled(); raw != "" {
+		if disabled {
+			fmt.Fprintln(os.Stderr, "       SIP: 已关闭. 如果仍失败, 多半是未以管理员运行、WeChat 未登录、或 TCC/签名限制.")
+		} else {
+			fmt.Fprintf(os.Stderr, "       SIP: 已启用 (%s). 这不是唯一解; 推荐重签 WeChat, 不必进 Recovery 关 SIP.\n", raw)
+		}
+	}
+
+	sig := inspectWeChatSignature()
+	if sig.Err != nil {
+		fmt.Fprintf(os.Stderr, "       WeChat 签名检测失败: %v\n", sig.Err)
+		if sig.Raw != "" {
+			fmt.Fprintf(os.Stderr, "       codesign 输出: %s\n", sig.Raw)
+		}
+	} else if sig.AdHoc {
+		fmt.Fprintln(os.Stderr, "       WeChat 签名: ad-hoc, 已是推荐状态. 请确认用管理员权限运行: sudo wxkey setup")
+	} else if sig.Runtime {
+		fmt.Fprintln(os.Stderr, "       WeChat 签名: 官方 Hardened Runtime. 推荐执行一次:")
+		fmt.Fprintln(os.Stderr, "         ./wxkey resign-wechat")
+		fmt.Fprintln(os.Stderr, "       然后等 WeChat 完全登录并打开一个聊天, 再跑:")
+		fmt.Fprintln(os.Stderr, "         sudo wxkey setup")
+	} else {
+		fmt.Fprintln(os.Stderr, "       WeChat 签名: 未识别. 可先跑 `wxkey doctor` 查看详情.")
+	}
+
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "       兜底方案仍然可用: Recovery Mode 里执行 `csrutil disable`, 但不再作为默认推荐.")
+}
+
 // sipDisabled parses `csrutil status`. Returns disabled=true only if csrutil
 // runs cleanly AND output explicitly says disabled. Indeterminate cases
 // (csrutil missing / output unparseable) return (false, "") so the caller
@@ -468,43 +717,6 @@ func sipDisabled() (disabled bool, raw string) {
 	return false, ""
 }
 
-// requireSIPDisabled is a soft pre-flight check called at the entry of any
-// command that needs task_for_pid (scan / setup / doctor). When SIP is on,
-// it prints a Chinese-language error explaining why and how to fix, then
-// exits non-zero before we ever touch the kernel. Set WXKEY_SKIP_SIP_CHECK=1
-// to bypass (e.g. if you signed wxkey with a debugger entitlement).
-func requireSIPDisabled(quiet bool) {
-	if os.Getenv("WXKEY_SKIP_SIP_CHECK") == "1" {
-		return
-	}
-	disabled, raw := sipDisabled()
-	if disabled {
-		return
-	}
-	if raw == "" {
-		// csrutil unavailable or unparseable — let downstream syscall error speak.
-		return
-	}
-	if quiet {
-		fmt.Fprintf(os.Stderr, "wxkey: SIP enabled, task_for_pid will fail. Disable SIP via Recovery Mode → `csrutil disable`. Raw: %s\n", raw)
-		os.Exit(2)
-	}
-	fmt.Fprintln(os.Stderr, "[FAIL] SIP (System Integrity Protection) 当前为启用状态")
-	fmt.Fprintln(os.Stderr, "       wxkey 需要 task_for_pid 读微信进程内存, SIP 启用时 macOS 内核硬性拒绝.")
-	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "       关闭步骤 (Apple Silicon):")
-	fmt.Fprintln(os.Stderr, "         1. 关机, 长按电源键进 Recovery Mode")
-	fmt.Fprintln(os.Stderr, "         2. 顶部菜单 Utilities → Terminal")
-	fmt.Fprintln(os.Stderr, "         3. 跑: csrutil disable")
-	fmt.Fprintln(os.Stderr, "         4. 重启回常规系统")
-	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "       关完再跑: ./wxkey doctor  验证")
-	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintf(os.Stderr, "       csrutil 原始输出: %s\n", raw)
-	fmt.Fprintln(os.Stderr, "       (若你已自签 debugger entitlement, 设 WXKEY_SKIP_SIP_CHECK=1 跳过本预检)")
-	os.Exit(2)
-}
-
 // reExecElevated re-launches this binary under osascript with administrator
 // privileges, blocking until it exits, and forwards stdout/stderr.
 func reExecElevated() error {
@@ -520,6 +732,70 @@ func reExecElevated() error {
 	osa.Stdout = os.Stdout
 	osa.Stderr = os.Stderr
 	return osa.Run()
+}
+
+func runResignWeChat() {
+	if os.Geteuid() != 0 && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
+		fmt.Fprintln(os.Stderr, "[wxkey] re-launching resign-wechat via osascript admin...")
+		if err := reExecElevated(); err != nil {
+			fail("re-elevate resign-wechat: %v", err)
+		}
+		return
+	}
+	if os.Geteuid() != 0 {
+		fail("resign-wechat requires administrator privileges; run `sudo wxkey resign-wechat`")
+	}
+
+	fmt.Println("=== wxkey resign-wechat ===")
+	if _, err := os.Stat(wechatAppPath); err != nil {
+		fail("WeChat app not found at %s: %v", wechatAppPath, err)
+	}
+
+	fmt.Println("[1/4] Quitting WeChat if it is running...")
+	_ = exec.Command("/usr/bin/killall", "WeChat").Run()
+	time.Sleep(2 * time.Second)
+
+	fmt.Println("[2/4] Ad-hoc signing /Applications/WeChat.app...")
+	out, err := runCodesignWeChat()
+	if err != nil && strings.Contains(string(out), "signature in use") {
+		plugin := filepath.Join(wechatAppPath, "Contents", "Frameworks", "vlc_plugins", "librtp_mpeg4_plugin.dylib")
+		if _, statErr := os.Stat(plugin); statErr == nil {
+			fmt.Println("      codesign reported signature in use; removing nested plugin signature and retrying...")
+			rmOut, rmErr := exec.Command("/usr/bin/codesign", "--remove-signature", plugin).CombinedOutput()
+			if rmErr != nil {
+				fail("remove nested signature failed: %v\n%s", rmErr, strings.TrimSpace(string(rmOut)))
+			}
+			out, err = runCodesignWeChat()
+		}
+	}
+	if err != nil {
+		fail("codesign WeChat failed: %v\n%s", err, strings.TrimSpace(string(out)))
+	}
+
+	fmt.Println("[3/4] Verifying signature state...")
+	sig := inspectWeChatSignature()
+	if sig.Err != nil {
+		fail("inspect WeChat signature after resign failed: %v\n%s", sig.Err, sig.Raw)
+	}
+	if !sig.AdHoc {
+		fail("WeChat signature is still not ad-hoc after codesign:\n%s", sig.Raw)
+	}
+	fmt.Println("      WeChat signature is ad-hoc.")
+
+	fmt.Println("[4/4] Reopening WeChat...")
+	if err := exec.Command("/usr/bin/open", wechatAppPath).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] open WeChat failed: %v\n", err)
+		fmt.Fprintln(os.Stderr, "       Open WeChat manually, wait for login, then run `sudo wxkey setup`.")
+		return
+	}
+
+	fmt.Println("")
+	fmt.Println("Done. After WeChat is fully logged in and you have opened at least one chat, run:")
+	fmt.Println("  sudo wxkey setup")
+}
+
+func runCodesignWeChat() ([]byte, error) {
+	return exec.Command("/usr/bin/codesign", "--force", "--deep", "--sign", "-", wechatAppPath).CombinedOutput()
 }
 
 func quoteArgs(args []string) []string {
@@ -566,14 +842,30 @@ func runDoctor(args []string) {
 	logf("=== wxkey doctor ===\n")
 
 	if disabled, raw := sipDisabled(); !disabled && raw != "" {
-		logf("[FAIL] SIP 启用 — wxkey 需要 SIP 关闭才能扫内存\n")
-		logf("       关法: Recovery Mode → Terminal → csrutil disable → 重启\n")
-		logf("       原始: %s\n", raw)
-		os.Exit(1)
+		logf("[INFO] SIP 已启用: %s\n", raw)
+		logf("       这不是硬性失败; 推荐路线是 ad-hoc 重签 WeChat 后用管理员权限取 key.\n")
 	} else if disabled {
 		logf("[OK]   SIP 已关闭\n")
 	} else {
 		logf("[INFO] csrutil 不可用, 跳过 SIP 预检\n")
+	}
+
+	sig := inspectWeChatSignature()
+	if sig.Err != nil {
+		logf("[WARN] WeChat 签名检测失败: %v\n", sig.Err)
+		if sig.Raw != "" {
+			logf("       codesign 输出: %s\n", sig.Raw)
+		}
+	} else if sig.AdHoc {
+		logf("[OK]   WeChat 签名: ad-hoc (推荐的 no-SIP 取 key 状态)\n")
+	} else if sig.Runtime {
+		logf("[WARN] WeChat 签名: 官方 Hardened Runtime\n")
+		logf("       若 task_for_pid 被拒, 跑 `wxkey resign-wechat` 后重试, 通常无需关闭 SIP.\n")
+	} else {
+		logf("[INFO] WeChat 签名: 未识别\n")
+		if sig.Raw != "" {
+			logf("       %s\n", sig.Raw)
+		}
 	}
 
 	pids, _ := wechatPIDs()
@@ -633,7 +925,7 @@ func runDoctor(args []string) {
 	if err != nil {
 		logf("[FAIL] Memory scan 失败: %v\n", err)
 		if isPermissionErr(err) {
-			logf("       task_for_pid 被拒。SIP 可能阻挡，或者你不是以 sudo 运行\n")
+			printPermissionAdvice(f.quiet, err)
 		}
 		os.Exit(1)
 	}
@@ -693,12 +985,11 @@ func findBundledDylib() string {
 			)
 		}
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates,
-			filepath.Join(home, "cc-workspace", "mcp-servers", "wx-mcp", "lib", "libWCDB.dylib"),
-			filepath.Join(home, ".config", "wxcli", "lib", "libWCDB.dylib"),
-		)
-	}
+	home := effectiveUserHome()
+	candidates = append(candidates,
+		filepath.Join(home, "cc-workspace", "mcp-servers", "wx-mcp", "lib", "libWCDB.dylib"),
+		filepath.Join(home, ".config", "wxcli", "lib", "libWCDB.dylib"),
+	)
 	candidates = append(candidates,
 		"/Applications/WeFlow.app/Contents/Resources/resources/wcdb/macos/universal/libWCDB.dylib")
 	for _, p := range candidates {
@@ -719,6 +1010,22 @@ func chownToDirOwner(path string) {
 		return
 	}
 	info, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		return
+	}
+	sys, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return
+	}
+	_ = os.Chown(path, int(sys.Uid), int(sys.Gid))
+}
+
+func chownToInvokingUser(path string) {
+	if os.Geteuid() != 0 {
+		return
+	}
+	home := effectiveUserHome()
+	info, err := os.Stat(home)
 	if err != nil {
 		return
 	}

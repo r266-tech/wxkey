@@ -1,10 +1,10 @@
 // Package machvm wraps the Mach VM syscalls used to enumerate and read another
 // process's memory on macOS. Implemented via purego (no cgo).
 //
-// task_for_pid is gated by the kernel: the caller needs either root, SIP
-// disabled + a user-approved task port grant, or the
-// com.apple.security.cs.debugger entitlement. wxkey relies on the second path
-// (admin re-launch via osascript) when the direct call returns KERN_FAILURE.
+// task_for_pid is gated by macOS taskgated/kernel policy: the caller needs a
+// debuggable target process plus sufficient caller privilege. For WeChat, the
+// most convenient route is usually ad-hoc-signing WeChat.app and running wxkey
+// with admin privileges; SIP-disabled or a debugger entitlement are fallbacks.
 package machvm
 
 import (
@@ -89,7 +89,7 @@ func Attach(pid int32) (*Process, error) {
 	self := machTaskSelf()
 	var task uint32
 	if kr := taskForPid(self, pid, &task); kr != KERN_SUCCESS {
-		return nil, fmt.Errorf("task_for_pid pid=%d kr=%d (need root, debugger entitlement, or SIP-disabled + user grant)", pid, kr)
+		return nil, fmt.Errorf("task_for_pid pid=%d kr=%d (need admin privileges plus ad-hoc-signed WeChat, debugger entitlement, or SIP-disabled fallback)", pid, kr)
 	}
 	return &Process{pid: pid, task: task, self: self}, nil
 }

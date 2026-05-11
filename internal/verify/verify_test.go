@@ -11,7 +11,10 @@ import (
 // verification, plus the 64-hex master key. Empty strings if env not present.
 func liveDB(t *testing.T) (path, hexKey string) {
 	t.Helper()
-	const candidate = "/Users/admin/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/wxid_3qqa0aja1kf612_f06d/db_storage/contact/contact.db"
+	candidate := os.Getenv("WXKEY_TEST_DB")
+	if candidate == "" {
+		t.Skip("WXKEY_TEST_DB not set")
+	}
 	if _, err := os.Stat(candidate); err != nil {
 		t.Skipf("live DB not present: %v", err)
 	}
