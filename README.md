@@ -11,7 +11,7 @@ it later.
 ## Install
 
 ```bash
-go install github.com/r266-tech/wxkey/cmd/wxkey@latest
+go install github.com/r266-tech/wxkey/cmd/wxkey@v1.4.2
 ```
 
 ## Usage
