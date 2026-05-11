@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	userpkg "os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -450,6 +451,14 @@ func runSetupCaptured(f scanFlags) (*setupOutput, error) {
 }
 
 func effectiveUserHome() string {
+	// reExecElevated forwards the invoking user's HOME explicitly when it
+	// spawns the elevated (root) child via osascript. Trust that first —
+	// stat /dev/console and SUDO_USER are both unreliable in non-sudo paths
+	// (e.g. osascript admin under fast user switching / locked screen /
+	// headless sessions).
+	if h := strings.TrimSpace(os.Getenv("WXKEY_ORIG_HOME")); h != "" {
+		return h
+	}
 	if u := strings.TrimSpace(os.Getenv("SUDO_USER")); u != "" && u != "root" {
 		return filepath.Join("/Users", u)
 	}
@@ -785,14 +794,26 @@ func sipDisabled() (disabled bool, raw string) {
 }
 
 // reExecElevated re-launches this binary under osascript with administrator
-// privileges, blocking until it exits, and forwards stdout/stderr.
+// privileges, blocking until it exits, and forwards stdout/stderr. It also
+// forwards the invoking user's HOME and USER so the elevated (root) child
+// can locate `~/Library/Containers/com.tencent.xinWeChat/...` belonging to
+// the desktop user — `stat /dev/console` alone is unreliable (e.g. fast
+// user switching, screen locked, headless sessions all break it).
 func reExecElevated() error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
+	origHome, _ := os.UserHomeDir()
+	origUser := os.Getenv("USER")
+	if origUser == "" {
+		if cu, err := userpkg.Current(); err == nil {
+			origUser = cu.Username
+		}
+	}
 	args := strings.Join(quoteArgs(append([]string{exe}, os.Args[1:]...)), " ")
-	cmd := fmt.Sprintf("WXKEY_ELEVATED=1 %s", args)
+	cmd := fmt.Sprintf("WXKEY_ELEVATED=1 WXKEY_ORIG_HOME=%s WXKEY_ORIG_USER=%s %s",
+		shellQuote(origHome), shellQuote(origUser), args)
 	script := fmt.Sprintf(`do shell script %q with administrator privileges`,
 		cmd+" 2>&1") // capture stderr too so we can surface it
 	osa := exec.Command("/usr/bin/osascript", "-e", script)
@@ -868,9 +889,13 @@ func runCodesignWeChat() ([]byte, error) {
 func quoteArgs(args []string) []string {
 	out := make([]string, len(args))
 	for i, a := range args {
-		out[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+		out[i] = shellQuote(a)
 	}
 	return out
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // startOrphanWatchdog runs only in elevated children spawned via osascript.
