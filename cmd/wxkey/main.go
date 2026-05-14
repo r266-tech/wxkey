@@ -5,6 +5,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -54,10 +55,11 @@ Subcommands:
 
 Notes:
   - WeChat must be running and have opened at least one DB this session.
-  - wx-mcp runtime DB decryption does not require SIP-disabled. First-time key
-    extraction only needs a readable WeChat task port: ad-hoc-signed WeChat +
-    admin privileges is the recommended route; SIP-disabled is only a fallback.
-  - wxkey will re-launch itself via osascript if the direct attach fails (set
+  - SIP stays enabled. First-time key extraction uses one route only:
+    ad-hoc-signed WeChat + sudo privileges. wxkey asks for the admin password
+    once and stores it in the user's macOS Keychain for later unattended
+    refreshes.
+  - wxkey will re-launch itself through sudo -S when direct attach fails (set
     WXKEY_NO_ELEVATE=1 to disable that auto-relaunch).
 `
 
@@ -163,17 +165,12 @@ type setupOutput struct {
 // SQLCipher 4 enc_key (post-PBKDF2) per file salt. wx-mcp passes them to
 // sqlite3_key_v2 as 96-hex `x'<key><salt>'` SQL literals (raw-key path),
 // avoiding the 256000-round PBKDF2 on every DB open.
-//
-// "key" (legacy) is the user-supplied master password — kept on
-// re-runs only if it was already there, so older wx-mcp builds keep working
-// until they ship the new code.
 type wxcliConfig struct {
 	SchemaVersion int               `json:"schema_version"`
 	WxID          string            `json:"wxid"`
 	DBRoot        string            `json:"db_root"`
 	Keys          map[string]string `json:"keys"`
 	KeyEpoch      int64             `json:"key_epoch"`
-	Key           string            `json:"key,omitempty"` // legacy master password (preserved if present)
 }
 
 func runScan(args []string, doSetup bool) {
@@ -213,7 +210,7 @@ func runScan(args []string, doSetup bool) {
 	if err != nil {
 		// Auto-elevate on permission failure.
 		if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
-			logf(f.quiet, "[wxkey] task_for_pid denied; re-launching via osascript admin...\n")
+			logf(f.quiet, "[wxkey] task_for_pid denied; re-launching via stored sudo credential...\n")
 			if reErr := reExecElevated(); reErr != nil {
 				fail("%s", buildElevateFailHint(reErr, err))
 			}
@@ -253,17 +250,6 @@ func runScan(args []string, doSetup bool) {
 	}
 	chownToInvokingUser(filepath.Dir(cfgPath))
 
-	// Preserve any existing legacy "key" field so older wx-mcp builds keep
-	// working until V upgrades. We don't carry over old "keys" map — the
-	// fresh scan supersedes it.
-	var legacyKey string
-	if existing, err := os.ReadFile(cfgPath); err == nil {
-		var prior wxcliConfig
-		if json.Unmarshal(existing, &prior) == nil {
-			legacyKey = prior.Key
-		}
-	}
-
 	keysMap := make(map[string]string, len(out.Results))
 	for _, r := range out.Results {
 		keysMap[r.SaltHex] = r.KeyHex
@@ -275,7 +261,6 @@ func runScan(args []string, doSetup bool) {
 		DBRoot:        root,
 		Keys:          keysMap,
 		KeyEpoch:      time.Now().Unix(),
-		Key:           legacyKey,
 	}
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	data = append(data, '\n')
@@ -285,7 +270,7 @@ func runScan(args []string, doSetup bool) {
 	chownToInvokingUser(cfgPath)
 	chownToDirOwner(cfgPath)
 	if len(out.Results) < len(saltIdx) {
-		fmt.Fprintf(os.Stderr, "[wxkey] WARNING: 部分 key 缺失 (%d/%d). 跑 `sudo wxkey doctor` 看哪些 DB 没拿到 key, 通常是因为还没在 WeChat 里打开过那个聊天。\n",
+		fmt.Fprintf(os.Stderr, "[wxkey] WARNING: 部分 key 缺失 (%d/%d). 跑 `wxkey doctor` 看哪些 DB 没拿到 key, 通常是因为还没在 WeChat 里打开过那个聊天。\n",
 			len(out.Results), len(saltIdx))
 	}
 	writeJSON(setupOutput{scanOutput: out, ConfigPath: cfgPath})
@@ -307,16 +292,20 @@ func runBootstrap(args []string) {
 	if cfgPath == "" {
 		cfgPath = defaultConfigPath()
 	}
+	if err := ensureStoredSudoPassword(); err != nil {
+		fail("prepare stored sudo credential: %v", err)
+	}
 	if cfg, ok := configReady(cfgPath); ok {
 		fmt.Println("=== wxkey bootstrap ===")
 		fmt.Printf("[OK] key config already exists: %s\n", cfgPath)
 		fmt.Printf("     wxid=%s db_root=%s keys=%d\n", cfg.WxID, cfg.DBRoot, len(cfg.Keys))
-		fmt.Println("     wx-mcp can start now; no SIP change needed.")
+		fmt.Println("     sudo credential is stored in macOS Keychain; wx-mcp can refresh keys without SIP.")
 		return
 	}
 
 	fmt.Println("=== wxkey bootstrap ===")
-	fmt.Println("[INFO] Goal: prepare ~/.config/wxcli/config.json without requiring SIP-disabled.")
+	fmt.Println("[INFO] Goal: prepare ~/.config/wxcli/config.json with SIP enabled.")
+	fmt.Println("[INFO] Admin password is stored once in macOS Keychain for unattended future setup/refresh.")
 
 	if _, err := os.Stat(wechatAppPath); err != nil {
 		fail("WeChat app not found at %s: %v", wechatAppPath, err)
@@ -357,7 +346,7 @@ func runBootstrap(args []string) {
 	fmt.Printf("       db_root: %s\n", res.Root)
 	fmt.Printf("       keys: %d\n", len(res.Results))
 	fmt.Println("")
-	fmt.Println("Done. Register/start wx-mcp now; runtime DB decryption does not require SIP-disabled.")
+	fmt.Println("Done. Register/start wx-mcp now; future key refresh uses stored sudo while SIP stays enabled.")
 }
 
 // --- helpers ---
@@ -452,9 +441,9 @@ func runSetupCaptured(f scanFlags) (*setupOutput, error) {
 
 func effectiveUserHome() string {
 	// reExecElevated forwards the invoking user's HOME explicitly when it
-	// spawns the elevated (root) child via osascript. Trust that first —
+	// spawns the elevated (root) child via sudo. Trust that first —
 	// stat /dev/console and SUDO_USER are both unreliable in non-sudo paths
-	// (e.g. osascript admin under fast user switching / locked screen /
+	// (e.g. GUI prompts under fast user switching / locked screen /
 	// headless sessions).
 	if h := strings.TrimSpace(os.Getenv("WXKEY_ORIG_HOME")); h != "" {
 		return h
@@ -636,27 +625,134 @@ func isPermissionErr(err error) bool {
 		(strings.Contains(msg, "kr=5") || strings.Contains(msg, "kr=4"))
 }
 
-// buildElevateFailHint composes an actionable hint when osascript-based
-// auto-elevation fails (e.g. user cancelled the password dialog, SSH session
-// with no GUI, or the dialog never surfaced because wxkey was launched from
-// a non-interactive AI agent shell).
+const sudoKeychainService = "r266.wx-mcp.sudo"
+
+func sudoKeychainAccount() string {
+	if u := strings.TrimSpace(os.Getenv("WXKEY_ORIG_USER")); u != "" && u != "root" {
+		return u
+	}
+	if u := strings.TrimSpace(os.Getenv("SUDO_USER")); u != "" && u != "root" {
+		return u
+	}
+	if cu, err := userpkg.Current(); err == nil {
+		if cu.Username != "" && cu.Username != "root" {
+			return cu.Username
+		}
+	}
+	if u := strings.TrimSpace(os.Getenv("USER")); u != "" {
+		return u
+	}
+	return "wx-mcp"
+}
+
+func ensureStoredSudoPassword() error {
+	if os.Geteuid() == 0 {
+		return nil
+	}
+	if pw, err := readStoredSudoPassword(); err == nil {
+		if err := sudoValidatePassword(pw); err == nil {
+			return nil
+		}
+	}
+	pw, err := promptSudoPasswordGUI()
+	if err != nil {
+		return err
+	}
+	if err := sudoValidatePassword(pw); err != nil {
+		return fmt.Errorf("sudo password rejected: %w", err)
+	}
+	if err := storeSudoPassword(pw); err != nil {
+		return err
+	}
+	return nil
+}
+
+func readStoredSudoPassword() (string, error) {
+	cmd := exec.Command("/usr/bin/security", "find-generic-password",
+		"-a", sudoKeychainAccount(),
+		"-s", sudoKeychainService,
+		"-w")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	pw := strings.TrimRight(string(out), "\r\n")
+	if pw == "" {
+		return "", fmt.Errorf("stored sudo password is empty")
+	}
+	return pw, nil
+}
+
+func storeSudoPassword(password string) error {
+	script := fmt.Sprintf("add-generic-password -a %s -s %s -l %s -j %s -U -X %s\n",
+		securityArgQuote(sudoKeychainAccount()),
+		securityArgQuote(sudoKeychainService),
+		securityArgQuote("wx-mcp sudo password"),
+		securityArgQuote("Stored by wxkey for unattended no-SIP WeChat DB key refresh"),
+		hex.EncodeToString([]byte(password)),
+	)
+	cmd := exec.Command("/usr/bin/security", "-i")
+	cmd.Stdin = strings.NewReader(script)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("store sudo password in Keychain: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+func securityArgQuote(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	return `"` + s + `"`
+}
+
+func promptSudoPasswordGUI() (string, error) {
+	script := `display dialog "wx-mcp needs your Mac admin password once. It will be stored in your macOS Keychain so future WeChat key refreshes can run unattended without disabling SIP." default answer "" with hidden answer buttons {"Cancel", "Store"} default button "Store" cancel button "Cancel" with title "wx-mcp setup"`
+	cmd := exec.Command("/usr/bin/osascript", "-e", script, "-e", "text returned of result")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("sudo password prompt cancelled or failed: %w", err)
+	}
+	pw := strings.TrimRight(string(out), "\r\n")
+	if pw == "" {
+		return "", fmt.Errorf("empty sudo password")
+	}
+	return pw, nil
+}
+
+func sudoValidatePassword(password string) error {
+	cmd := exec.Command("sudo", "-S", "-p", "", "-v")
+	cmd.Stdin = strings.NewReader(password + "\n")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+func sudoCommandWithPassword(password string, args ...string) *exec.Cmd {
+	cmd := exec.Command("sudo", append([]string{"-S", "-p", ""}, args...)...)
+	cmd.Stdin = strings.NewReader(password + "\n")
+	return cmd
+}
+
+// buildElevateFailHint composes an actionable hint when stored-sudo
+// auto-elevation fails.
 func buildElevateFailHint(reErr, origErr error) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "auto-elevate via osascript failed: %v\n", reErr)
+	fmt.Fprintf(&b, "auto-elevate via stored sudo credential failed: %v\n", reErr)
 	fmt.Fprintf(&b, "       original permission error: %v\n", origErr)
 	fmt.Fprintln(&b, "")
 	if os.Getenv("SSH_CONNECTION") != "" || os.Getenv("SSH_CLIENT") != "" || os.Getenv("SSH_TTY") != "" {
-		fmt.Fprintln(&b, "       You appear to be on SSH. osascript needs a desktop GUI session to")
-		fmt.Fprintln(&b, "       show the macOS password prompt. Options:")
-		fmt.Fprintln(&b, "         a) Run `wxkey bootstrap` on the Mac's local desktop (no sudo).")
-		fmt.Fprintln(&b, "         b) Over SSH, run `sudo wxkey bootstrap` in your interactive shell")
-		fmt.Fprintln(&b, "            (sudo needs a real tty; AI agents / pipes will not work).")
+		fmt.Fprintln(&b, "       You appear to be on SSH. Run `wxkey bootstrap` once from the Mac's")
+		fmt.Fprintln(&b, "       desktop session so wxkey can collect and store the sudo password in")
+		fmt.Fprintln(&b, "       Keychain. Later setup runs can be unattended.")
 	} else {
-		fmt.Fprintln(&b, "       The macOS password prompt may have been cancelled or never surfaced.")
-		fmt.Fprintln(&b, "       Re-run `wxkey bootstrap` directly on the Mac's desktop (do NOT add")
-		fmt.Fprintln(&b, "       sudo, and do NOT pipe it through an AI agent / non-interactive shell;")
-		fmt.Fprintln(&b, "       both prevent the password dialog from working). When the macOS dialog")
-		fmt.Fprintln(&b, "       appears, type your admin password to grant task_for_pid access.")
+		fmt.Fprintln(&b, "       Re-run `wxkey bootstrap` once and enter the Mac admin password in the")
+		fmt.Fprintln(&b, "       wx-mcp hidden prompt. wxkey will verify it and store it in Keychain.")
 	}
 	return b.String()
 }
@@ -741,13 +837,13 @@ func printPermissionAdvice(quiet bool, original error) {
 		fmt.Fprintf(os.Stderr, "       原始错误: %v\n", original)
 	}
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "       wx-mcp 的运行时解密不需要关闭 SIP; 只有首次取 key 需要读取 WeChat 进程内存.")
+	fmt.Fprintln(os.Stderr, "       wx-mcp 的运行时解密不需要关闭 SIP; 取 key 只需要 no-SIP 重签 + 已存储的 sudo 凭据.")
 
 	if disabled, raw := sipDisabled(); raw != "" {
 		if disabled {
 			fmt.Fprintln(os.Stderr, "       SIP: 已关闭. 如果仍失败, 多半是未以管理员运行、WeChat 未登录、或 TCC/签名限制.")
 		} else {
-			fmt.Fprintf(os.Stderr, "       SIP: 已启用 (%s). 这不是唯一解; 推荐重签 WeChat, 不必进 Recovery 关 SIP.\n", raw)
+			fmt.Fprintf(os.Stderr, "       SIP: 已启用 (%s). 这是支持状态; 不要进 Recovery 关 SIP.\n", raw)
 		}
 	}
 
@@ -758,18 +854,18 @@ func printPermissionAdvice(quiet bool, original error) {
 			fmt.Fprintf(os.Stderr, "       codesign 输出: %s\n", sig.Raw)
 		}
 	} else if sig.AdHoc {
-		fmt.Fprintln(os.Stderr, "       WeChat 签名: ad-hoc, 已是推荐状态. 请确认用管理员权限运行: sudo wxkey setup")
+		fmt.Fprintln(os.Stderr, "       WeChat 签名: ad-hoc, 已是推荐状态. 请先跑 `wxkey bootstrap` 存储 sudo 凭据")
 	} else if sig.Runtime {
 		fmt.Fprintln(os.Stderr, "       WeChat 签名: 官方 Hardened Runtime. 推荐执行一次:")
 		fmt.Fprintln(os.Stderr, "         ./wxkey resign-wechat")
 		fmt.Fprintln(os.Stderr, "       然后等 WeChat 完全登录并打开一个聊天, 再跑:")
-		fmt.Fprintln(os.Stderr, "         sudo wxkey setup")
+		fmt.Fprintln(os.Stderr, "         wxkey setup")
 	} else {
 		fmt.Fprintln(os.Stderr, "       WeChat 签名: 未识别. 可先跑 `wxkey doctor` 查看详情.")
 	}
 
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "       兜底方案仍然可用: Recovery Mode 里执行 `csrutil disable`, 但不再作为默认推荐.")
+	fmt.Fprintln(os.Stderr, "       不支持通过关闭 SIP 作为安装路径; 修复 no-SIP sudo/Keychain 路径.")
 }
 
 // sipDisabled parses `csrutil status`. Returns disabled=true only if csrutil
@@ -793,7 +889,7 @@ func sipDisabled() (disabled bool, raw string) {
 	return false, ""
 }
 
-// reExecElevated re-launches this binary under osascript with administrator
+// reExecElevated re-launches this binary under sudo with administrator
 // privileges, blocking until it exits, and forwards stdout/stderr. It also
 // forwards the invoking user's HOME and USER so the elevated (root) child
 // can locate `~/Library/Containers/com.tencent.xinWeChat/...` belonging to
@@ -804,6 +900,16 @@ func reExecElevated() error {
 	if err != nil {
 		return err
 	}
+	pw, err := readStoredSudoPassword()
+	if err != nil {
+		if err := ensureStoredSudoPassword(); err != nil {
+			return err
+		}
+		pw, err = readStoredSudoPassword()
+		if err != nil {
+			return err
+		}
+	}
 	origHome, _ := os.UserHomeDir()
 	origUser := os.Getenv("USER")
 	if origUser == "" {
@@ -811,27 +917,29 @@ func reExecElevated() error {
 			origUser = cu.Username
 		}
 	}
-	args := strings.Join(quoteArgs(append([]string{exe}, os.Args[1:]...)), " ")
-	cmd := fmt.Sprintf("WXKEY_ELEVATED=1 WXKEY_ORIG_HOME=%s WXKEY_ORIG_USER=%s %s",
-		shellQuote(origHome), shellQuote(origUser), args)
-	script := fmt.Sprintf(`do shell script %q with administrator privileges`,
-		cmd+" 2>&1") // capture stderr too so we can surface it
-	osa := exec.Command("/usr/bin/osascript", "-e", script)
-	osa.Stdout = os.Stdout
-	osa.Stderr = os.Stderr
-	return osa.Run()
+	args := []string{"env",
+		"WXKEY_ELEVATED=1",
+		"WXKEY_ORIG_HOME=" + origHome,
+		"WXKEY_ORIG_USER=" + origUser,
+		exe,
+	}
+	args = append(args, os.Args[1:]...)
+	cmd := sudoCommandWithPassword(pw, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func runResignWeChat() {
 	if os.Geteuid() != 0 && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
-		fmt.Fprintln(os.Stderr, "[wxkey] re-launching resign-wechat via osascript admin...")
+		fmt.Fprintln(os.Stderr, "[wxkey] re-launching resign-wechat via stored sudo credential...")
 		if err := reExecElevated(); err != nil {
 			fail("re-elevate resign-wechat: %v", err)
 		}
 		return
 	}
 	if os.Geteuid() != 0 {
-		fail("resign-wechat requires administrator privileges; run `sudo wxkey resign-wechat`")
+		fail("resign-wechat requires administrator privileges; run `wxkey bootstrap` once to store sudo credentials")
 	}
 
 	fmt.Println("=== wxkey resign-wechat ===")
@@ -873,33 +981,29 @@ func runResignWeChat() {
 	fmt.Println("[4/4] Reopening WeChat...")
 	if err := exec.Command("/usr/bin/open", wechatAppPath).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "[WARN] open WeChat failed: %v\n", err)
-		fmt.Fprintln(os.Stderr, "       Open WeChat manually, wait for login, then run `sudo wxkey setup`.")
+		fmt.Fprintln(os.Stderr, "       Open WeChat manually, wait for login, then run `wxkey setup`.")
 		return
 	}
 
 	fmt.Println("")
 	fmt.Println("Done. After WeChat is fully logged in and you have opened at least one chat, run:")
-	fmt.Println("  sudo wxkey setup")
+	fmt.Println("  wxkey setup")
 }
 
 func runCodesignWeChat() ([]byte, error) {
-	return exec.Command("/usr/bin/codesign", "--force", "--deep", "--sign", "-", wechatAppPath).CombinedOutput()
-}
-
-func quoteArgs(args []string) []string {
-	out := make([]string, len(args))
-	for i, a := range args {
-		out[i] = shellQuote(a)
+	if os.Geteuid() == 0 {
+		return exec.Command("/usr/bin/codesign", "--force", "--deep", "--sign", "-", wechatAppPath).CombinedOutput()
 	}
-	return out
+	pw, err := readStoredSudoPassword()
+	if err != nil {
+		return nil, err
+	}
+	cmd := sudoCommandWithPassword(pw, "/usr/bin/codesign", "--force", "--deep", "--sign", "-", wechatAppPath)
+	return cmd.CombinedOutput()
 }
 
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-// startOrphanWatchdog runs only in elevated children spawned via osascript.
-// reExecElevated chains user → osascript → sh → root wxkey. If anyone above
+// startOrphanWatchdog runs only in elevated children spawned via sudo.
+// reExecElevated chains user → sudo → root wxkey. If anyone above
 // dies (parent CC kill, user cancels admin prompt, TaskStop on the unprivileged
 // wxkey), the root child gets reparented to launchd (PPID=1). Without this,
 // it keeps holding task_for_pid + scanning, can't be killed by the user, and
@@ -952,7 +1056,7 @@ func runDoctor(args []string) {
 		logf("[OK]   WeChat 签名: ad-hoc (推荐的 no-SIP 取 key 状态)\n")
 	} else if sig.Runtime {
 		logf("[WARN] WeChat 签名: 官方 Hardened Runtime\n")
-		logf("       若 task_for_pid 被拒, 跑 `wxkey resign-wechat` 后重试, 通常无需关闭 SIP.\n")
+		logf("       若 task_for_pid 被拒, 跑 `wxkey bootstrap` 存储 sudo 凭据并重签 WeChat, 不要关闭 SIP.\n")
 	} else {
 		logf("[INFO] WeChat 签名: 未识别\n")
 		if sig.Raw != "" {
@@ -1007,7 +1111,7 @@ func runDoctor(args []string) {
 
 	if os.Geteuid() != 0 {
 		logf("\n[INFO] 未以 root 运行，跳过实际 scan\n")
-		logf("       完整诊断请跑: sudo wxkey doctor\n")
+		logf("       完整诊断请先跑: wxkey bootstrap; 然后重试 wxkey doctor\n")
 		return
 	}
 
@@ -1036,7 +1140,7 @@ func runDoctor(args []string) {
 		logf("[OK]   Key 覆盖率: %d/%d (100%%) — 所有 DB 都拿到了 key\n",
 			len(results), len(saltIdx))
 		logf("\n=== 全部就绪 ===\n")
-		logf("跑 `sudo wxkey setup` 写 config, 然后启动 wx-mcp\n")
+		logf("跑 `wxkey setup` 写 config, 然后启动 wx-mcp\n")
 		return
 	}
 
@@ -1059,7 +1163,7 @@ func runDoctor(args []string) {
 	}
 	logf("\n=== 部分覆盖 ===\n")
 	logf("方案 1: 在 WeChat 里打开缺的聊天/朋友圈/收藏，触发 WCDB 加载那些 DB key，然后重跑\n")
-	logf("方案 2: 直接 `sudo wxkey setup`，部分覆盖也能跑大部分 wx-mcp 功能\n")
+	logf("方案 2: 直接 `wxkey setup`，部分覆盖也能跑大部分 wx-mcp 功能\n")
 }
 
 // findBundledDylib hunts libWCDB.dylib in the same locations wx-mcp does.
@@ -1090,7 +1194,7 @@ func findBundledDylib() string {
 }
 
 // chownToDirOwner makes a freshly-written file owned by the same user as its
-// parent directory. wxkey runs `setup` as root via osascript admin, so the
+// parent directory. wxkey runs `setup` as root via stored sudo, so the
 // config file lands as root:wheel and the unprivileged caller (wx-mcp / shell)
 // then can't read it on the next start, looping forever into wxkey setup.
 // No-op when not running as root.

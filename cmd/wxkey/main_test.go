@@ -31,3 +31,11 @@ TeamIdentifier=5A4RE8SF68`)
 		t.Fatalf("did not expect ad-hoc signature")
 	}
 }
+
+func TestSudoKeychainAccountPrefersOriginalUser(t *testing.T) {
+	t.Setenv("WXKEY_ORIG_USER", "alice")
+	t.Setenv("SUDO_USER", "bob")
+	if got := sudoKeychainAccount(); got != "alice" {
+		t.Fatalf("sudoKeychainAccount = %q, want alice", got)
+	}
+}

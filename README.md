@@ -11,7 +11,7 @@ it later.
 ## Install
 
 ```bash
-go install github.com/r266-tech/wxkey/cmd/wxkey@v1.4.2
+go install github.com/r266-tech/wxkey/cmd/wxkey@latest
 ```
 
 ## Usage
@@ -31,15 +31,17 @@ wxkey bootstrap
 ```
 
 `bootstrap` checks existing config, applies the no-SIP ad-hoc signing route for
-WeChat.app when needed, then runs setup and prints only a summary. It does not
-print raw key material.
+WeChat.app when needed, asks for the Mac admin password once, stores that
+password in the user's macOS Keychain, then runs setup and prints only a
+summary. It does not print raw key material.
 
 ## SIP
 
-wx-mcp runtime DB decryption does not require SIP-disabled. First-time key
-extraction requires a readable local WeChat task port. The recommended path is
+SIP should stay enabled. First-time key extraction uses one supported path:
 ad-hoc-signing the user's local WeChat.app and running wxkey with administrator
-privileges; SIP-disabled is only a fallback.
+privileges. The admin password is stored in Keychain by `wxkey bootstrap` so
+later `wxkey setup` runs can refresh missing DB keys unattended. Disabling SIP is
+not a supported setup step.
 
 ## Security
 

@@ -2,9 +2,9 @@
 // process's memory on macOS. Implemented via purego (no cgo).
 //
 // task_for_pid is gated by macOS taskgated/kernel policy: the caller needs a
-// debuggable target process plus sufficient caller privilege. For WeChat, the
-// most convenient route is usually ad-hoc-signing WeChat.app and running wxkey
-// with admin privileges; SIP-disabled or a debugger entitlement are fallbacks.
+// debuggable target process plus sufficient caller privilege. wxkey's supported
+// WeChat route is ad-hoc-signing WeChat.app and running wxkey with admin
+// privileges while SIP stays enabled.
 package machvm
 
 import (
@@ -89,7 +89,7 @@ func Attach(pid int32) (*Process, error) {
 	self := machTaskSelf()
 	var task uint32
 	if kr := taskForPid(self, pid, &task); kr != KERN_SUCCESS {
-		return nil, fmt.Errorf("task_for_pid pid=%d kr=%d (need admin privileges plus ad-hoc-signed WeChat, debugger entitlement, or SIP-disabled fallback)", pid, kr)
+		return nil, fmt.Errorf("task_for_pid pid=%d kr=%d (need admin privileges plus ad-hoc-signed WeChat; run wxkey bootstrap and keep SIP enabled)", pid, kr)
 	}
 	return &Process{pid: pid, task: task, self: self}, nil
 }
