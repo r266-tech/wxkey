@@ -30,18 +30,19 @@ Recommended first-run path:
 wxkey bootstrap
 ```
 
-`bootstrap` checks existing config, applies the no-SIP ad-hoc signing route for
-WeChat.app when needed, asks for the Mac admin password once, stores that
-password in the user's macOS Keychain, then runs setup and prints only a
-summary. It does not print raw key material.
+`bootstrap` checks existing config, prepares an ad-hoc signed wx-mcp shadow copy
+of WeChat when needed, asks for the Mac admin password once, stores that password
+in the user's macOS Keychain, then runs setup and prints only a summary. It does
+not print raw key material.
 
 ## SIP
 
 SIP should stay enabled. First-time key extraction uses one supported path:
-ad-hoc-signing the user's local WeChat.app and running wxkey with administrator
-privileges. The admin password is stored in Keychain by `wxkey bootstrap` so
-later `wxkey setup` runs can refresh missing DB keys unattended. Disabling SIP is
-not a supported setup step.
+an ad-hoc signed WeChat process plus wxkey with administrator privileges.
+Bootstrap signs a wx-mcp-managed shadow copy when the installed WeChat app is
+protected by App Store app-management controls. The admin password is stored in
+Keychain by `wxkey bootstrap` so later `wxkey setup` runs can refresh missing DB
+keys unattended. Disabling SIP is not a supported setup step.
 
 ## Security
 

@@ -39,3 +39,15 @@ func TestSudoKeychainAccountPrefersOriginalUser(t *testing.T) {
 		t.Fatalf("sudoKeychainAccount = %q, want alice", got)
 	}
 }
+
+func TestPathInsideApp(t *testing.T) {
+	app := "/Users/alice/Library/Application Support/wx-mcp/WeChat-shadow.app"
+	proc := "/Users/alice/Library/Application Support/wx-mcp/WeChat-shadow.app/Contents/MacOS/WeChat"
+	if !pathInsideApp(proc, app) {
+		t.Fatalf("expected process path to be inside app bundle")
+	}
+	other := "/Applications/WeChat.app/Contents/MacOS/WeChat"
+	if pathInsideApp(other, app) {
+		t.Fatalf("did not expect original app process to match shadow app")
+	}
+}

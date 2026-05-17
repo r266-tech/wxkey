@@ -35,8 +35,9 @@ Usage:
 
 Subcommands:
   bootstrap   One-command first-run setup for humans/agents: checks existing
-              config, ad-hoc re-signs WeChat when needed, runs setup, and only
-              prints a summary (not key material).
+              config, prepares an ad-hoc signed wx-mcp shadow copy of WeChat
+              when needed, runs setup, and only prints a summary (not key
+              material).
   scan        Scan WeChat memory and print JSON: {pid, root, stats, results[]}.
               results[] entries map a DB salt to its 64-hex master key.
   setup       Like scan, but also writes ~/.config/wxcli/config.json so wx-mcp
@@ -48,17 +49,19 @@ Subcommands:
               for the actual memory scan. Run this first if mcp/wxkey behaves
               unexpectedly — it tells you what's missing without writing config.
   resign-wechat
-              Apply the recommended no-SIP route: quit WeChat, ad-hoc re-sign
-              /Applications/WeChat.app, then reopen it. Run once after each
-              WeChat update if task_for_pid is denied.
+              Operator diagnostic path: quit WeChat, ad-hoc re-sign
+              /Applications/WeChat.app, then reopen it. Bootstrap uses a
+              wx-mcp shadow copy by default to avoid App Store app-management
+              prompts.
   list-pids   Print one WeChat PID per line (or empty if not running).
 
 Notes:
   - WeChat must be running and have opened at least one DB this session.
   - SIP stays enabled. First-time key extraction uses one route only:
-    ad-hoc-signed WeChat + sudo privileges. wxkey asks for the admin password
-    once and stores it in the user's macOS Keychain for later unattended
-    refreshes.
+    ad-hoc-signed WeChat + sudo privileges. Bootstrap signs a wx-mcp-managed
+    shadow copy when the installed WeChat cannot be modified. wxkey asks for
+    the admin password once and stores it in the user's macOS Keychain for
+    later unattended refreshes.
   - wxkey will re-launch itself through sudo -S when direct attach fails (set
     WXKEY_NO_ELEVATE=1 to disable that auto-relaunch).
 `
@@ -311,6 +314,8 @@ func runBootstrap(args []string) {
 		fail("WeChat app not found at %s: %v", wechatAppPath, err)
 	}
 
+	setupFlags := f
+	var cleanup func()
 	sig := inspectWeChatSignature()
 	if sig.Err != nil {
 		fmt.Fprintf(os.Stderr, "[WARN] WeChat signature check failed: %v\n", sig.Err)
@@ -318,22 +323,35 @@ func runBootstrap(args []string) {
 			fmt.Fprintf(os.Stderr, "       codesign output: %s\n", sig.Raw)
 		}
 	} else if sig.Runtime && !sig.AdHoc {
-		fmt.Println("[INFO] WeChat has official Hardened Runtime; applying recommended no-SIP resign route.")
-		if err := runSelfPassthrough("resign-wechat"); err != nil {
-			fail("resign-wechat failed: %v", err)
+		if envTrue("WXKEY_BOOTSTRAP_ORIGINAL_WECHAT") {
+			fmt.Println("[INFO] WeChat has official Hardened Runtime; applying explicit original-app resign route.")
+			if err := runSelfPassthrough("resign-wechat"); err != nil {
+				fail("resign-wechat failed: %v", err)
+			}
+		} else {
+			fmt.Println("[INFO] WeChat has official Hardened Runtime; using wx-mcp shadow copy for no-SIP bootstrap.")
+			pid, done, err := prepareShadowWeChat()
+			if err != nil {
+				fail("prepare shadow WeChat: %v", err)
+			}
+			setupFlags.pid = pid
+			cleanup = done
 		}
 	} else if sig.AdHoc {
 		fmt.Println("[OK]   WeChat is already ad-hoc signed.")
 	} else {
 		fmt.Println("[INFO] WeChat signature state is not recognized; trying setup directly.")
 	}
+	if cleanup != nil {
+		defer cleanup()
+	}
 
-	if err := ensureWeChatReady(f.root, 90*time.Second); err != nil {
+	if err := ensureWeChatReady(setupFlags.root, setupFlags.pid, 90*time.Second); err != nil {
 		fail("%v", err)
 	}
 
 	fmt.Println("[INFO] Extracting keys and writing config...")
-	res, err := runSetupCaptured(f)
+	res, err := runSetupCaptured(setupFlags)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[wxkey] setup failed during bootstrap.\n")
 		fmt.Fprintf(os.Stderr, "        If WeChat just reopened, wait until it is fully logged in, open one chat, then rerun `wxkey bootstrap`.\n")
@@ -379,14 +397,130 @@ func runSelfPassthrough(args ...string) error {
 	return cmd.Run()
 }
 
-func ensureWeChatReady(root string, timeout time.Duration) error {
+func shadowWeChatPath() string {
+	if p := strings.TrimSpace(os.Getenv("WXKEY_SHADOW_WECHAT_APP")); p != "" {
+		return p
+	}
+	return filepath.Join(effectiveUserHome(), "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
+}
+
+func prepareShadowWeChat() (int, func(), error) {
+	shadowPath := shadowWeChatPath()
+	hadWeChatRunning := false
+	if pids, _ := wechatPIDs(); len(pids) > 0 {
+		hadWeChatRunning = true
+	}
+
+	fmt.Println("[INFO] Preparing wx-mcp WeChat shadow copy...")
+	if err := exec.Command("/usr/bin/killall", "WeChat").Run(); err != nil {
+		// killall exits non-zero when WeChat is not running. That is fine here.
+	}
+	time.Sleep(2 * time.Second)
+
+	if err := os.RemoveAll(shadowPath); err != nil {
+		return 0, nil, fmt.Errorf("remove stale shadow copy %s: %w", shadowPath, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(shadowPath), 0o755); err != nil {
+		return 0, nil, fmt.Errorf("mkdir shadow parent: %w", err)
+	}
+	if out, err := exec.Command("/bin/cp", "-R", wechatAppPath, shadowPath).CombinedOutput(); err != nil {
+		return 0, nil, fmt.Errorf("copy WeChat to shadow path: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.Command("/usr/bin/codesign", "--force", "--deep", "--sign", "-", shadowPath).CombinedOutput(); err != nil {
+		return 0, nil, fmt.Errorf("codesign shadow WeChat failed: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	sig := inspectAppSignature(shadowPath)
+	if sig.Err != nil {
+		return 0, nil, fmt.Errorf("inspect shadow WeChat signature: %w\n%s", sig.Err, sig.Raw)
+	}
+	if !sig.AdHoc {
+		return 0, nil, fmt.Errorf("shadow WeChat is not ad-hoc signed after codesign:\n%s", sig.Raw)
+	}
+
+	fmt.Println("[INFO] Opening wx-mcp WeChat shadow copy...")
+	if err := exec.Command("/usr/bin/open", "-n", shadowPath).Run(); err != nil {
+		return 0, nil, fmt.Errorf("open shadow WeChat: %w", err)
+	}
+	pid, err := waitForWeChatPIDUnderApp(shadowPath, 90*time.Second)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	cleanup := func() {
+		if envTrue("WXKEY_KEEP_SHADOW_WECHAT") {
+			return
+		}
+		_ = exec.Command("/bin/kill", "-TERM", strconv.Itoa(pid)).Run()
+		time.Sleep(1 * time.Second)
+		if hadWeChatRunning && !envTrue("WXKEY_NO_REOPEN_ORIGINAL_WECHAT") {
+			_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
+		}
+	}
+	return pid, cleanup, nil
+}
+
+func waitForWeChatPIDUnderApp(appPath string, timeout time.Duration) (int, error) {
 	deadline := time.Now().Add(timeout)
-	if pids, _ := wechatPIDs(); len(pids) == 0 {
+	for {
+		pids, err := wechatPIDs()
+		if err != nil {
+			return 0, err
+		}
+		sort.Sort(sort.Reverse(sort.IntSlice(pids)))
+		for _, pid := range pids {
+			procPath, err := commandPathForPID(pid)
+			if err != nil {
+				continue
+			}
+			if pathInsideApp(procPath, appPath) {
+				fmt.Printf("[OK]   shadow WeChat PID: %d\n", pid)
+				return pid, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("shadow WeChat did not start from %s; open WeChat, finish login, open one chat, then rerun `wxkey bootstrap`", appPath)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func commandPathForPID(pid int) (string, error) {
+	out, err := exec.Command("/bin/ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func pathInsideApp(procPath, appPath string) bool {
+	procPath = filepath.Clean(procPath)
+	appPath = filepath.Clean(appPath)
+	rel, err := filepath.Rel(appPath, procPath)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
+func ensureWeChatReady(root string, pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	if pid == 0 {
+		if pids, _ := wechatPIDs(); len(pids) == 0 {
+			fmt.Println("[INFO] Opening WeChat...")
+			_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
+		}
+	} else if !pidAlive(pid) {
 		fmt.Println("[INFO] Opening WeChat...")
 		_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
 	}
 	for {
-		if _, err := pickWeChatPID(); err == nil {
+		readyPID := false
+		if pid > 0 {
+			readyPID = pidAlive(pid)
+		} else if _, err := pickWeChatPID(); err == nil {
+			readyPID = true
+		}
+		if readyPID {
 			if root != "" {
 				if st, statErr := os.Stat(root); statErr == nil && st.IsDir() {
 					return nil
@@ -400,6 +534,13 @@ func ensureWeChatReady(root string, timeout time.Duration) error {
 		}
 		time.Sleep(2 * time.Second)
 	}
+}
+
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return exec.Command("/bin/kill", "-0", strconv.Itoa(pid)).Run() == nil
 }
 
 func runSetupCaptured(f scanFlags) (*setupOutput, error) {
@@ -819,7 +960,11 @@ func classifyWeChatSignature(raw string) wechatSignatureStatus {
 }
 
 func inspectWeChatSignature() wechatSignatureStatus {
-	out, err := exec.Command("/usr/bin/codesign", "-dv", wechatAppPath).CombinedOutput()
+	return inspectAppSignature(wechatAppPath)
+}
+
+func inspectAppSignature(appPath string) wechatSignatureStatus {
+	out, err := exec.Command("/usr/bin/codesign", "-dv", appPath).CombinedOutput()
 	st := classifyWeChatSignature(string(out))
 	st.Err = err
 	return st

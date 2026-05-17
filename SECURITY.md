@@ -16,7 +16,7 @@ Do not paste or upload:
 
 ## Privileged Side Effects
 
-`wxkey bootstrap` may quit and reopen WeChat, ad-hoc re-sign `/Applications/WeChat.app`, and request administrator privileges so it can read the local WeChat task port. It stores the Mac admin password in the user's macOS Keychain under a wx-mcp-specific service so future `wxkey setup` runs can use `sudo -S` unattended. Run `wxkey doctor` first when you want a read-only status check.
+`wxkey bootstrap` may quit and reopen WeChat, create and ad-hoc sign a wx-mcp-managed WeChat shadow copy, and request administrator privileges so it can read the local WeChat task port. It stores the Mac admin password in the user's macOS Keychain under a wx-mcp-specific service so future `wxkey setup` runs can use `sudo -S` unattended. The explicit `resign-wechat` diagnostic command can still modify `/Applications/WeChat.app`, but bootstrap avoids that by default. Run `wxkey doctor` first when you want a read-only status check.
 
 SIP should stay enabled. First-time and future key extraction use the same supported path: ad-hoc signing plus the stored sudo credential. Disabling SIP is not part of the supported setup flow.
 
