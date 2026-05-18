@@ -1,12 +1,12 @@
 # wxkey
 
 
-`wxkey` is the companion CLI used by [wx-mcp](https://github.com/r266-tech/wx-mcp)
+`wxkey` is the companion CLI used by [wechat-local-mcp](https://github.com/r266-tech/wechat-local-mcp)
 to initialize local WeChat 4.x WCDB keys on macOS.
 
 It reads the local WeChat process memory, finds candidate WCDB key material, and
 verifies candidates against local DB page-1 SQLCipher HMACs. It writes the
-resulting per-DB key map to `~/.config/wxcli/config.json`, where wx-mcp can read
+resulting per-DB key map to `~/.config/wxcli/config.json`, where wechat-local-mcp can read
 it later.
 
 ## Install
@@ -53,6 +53,6 @@ contents into public issues.
 ---
 
 <!-- babata-star-callout-v2 -->
-## If this saved you time
+## If wxkey helped you set things up
 
-Starring the repo helps me prioritize which integrations to keep maintained. This project is part of [babata](https://github.com/r266-tech) — a personal, macOS-native AI infrastructure stack.
+`wxkey` is a small bootstrap companion. The actual product you'll use day-to-day is **[wechat-local-mcp](https://github.com/r266-tech/wechat-local-mcp)** — that's the repo to star if you want to support continued maintenance. Part of [babata](https://github.com/r266-tech).
