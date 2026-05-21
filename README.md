@@ -36,6 +36,17 @@ of WeChat when needed, asks for the Mac admin password once, stores that passwor
 in the user's macOS Keychain, then runs setup and prints only a summary. It does
 not print raw key material.
 
+Agent boundary: agents should run `wxkey doctor` and `wxkey setup` themselves.
+If key coverage is partial, the agent should inspect the missing DB list, ask the
+user only to open the corresponding chat/page inside WeChat, then rerun
+`wxkey setup`. Do not hand these commands back to the user unless the user is
+explicitly operating without an agent.
+
+`wxkey doctor` is intentionally lightweight by default: it compares the cached
+key map in `~/.config/wxcli/config.json` against local DB salts and lists missing
+DBs without starting another memory scan. Use `wxkey doctor --scan` only when an
+agent needs to re-check live `task_for_pid` access or current heap key coverage.
+
 ## SIP
 
 SIP should stay enabled. First-time key extraction uses one supported path:

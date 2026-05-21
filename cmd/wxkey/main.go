@@ -28,7 +28,7 @@ Usage:
   wxkey bootstrap  [--root /path/to/xwechat_files/<wxid>] [--config ~/.config/wxcli/config.json]
   wxkey scan       [--pid N] [--root /path/to/xwechat_files/<wxid>] [--quiet]
   wxkey setup      [--pid N] [--root ...] [--config ~/.config/wxcli/config.json]
-  wxkey doctor     [--pid N] [--root ...] [--quiet]
+  wxkey doctor     [--pid N] [--root ...] [--config ...] [--quiet] [--scan]
   wxkey resign-wechat
   wxkey list-pids
   wxkey -h | --help
@@ -44,10 +44,9 @@ Subcommands:
               can pick up the key on next start. Picks the most populated DB
               under root to publish (typically contact.db or message db).
   doctor      Read-only health check: WeChat process, account dir, DB count,
-              libWCDB.dylib presence, task_for_pid permission, key coverage
-              (which DBs have keys in heap vs which are missing). Auto-elevates
-              for the actual memory scan. Run this first if mcp/wxkey behaves
-              unexpectedly — it tells you what's missing without writing config.
+              libWCDB.dylib presence, and cached key coverage from config.
+              It does not scan memory by default; pass --scan for the slower
+              live task_for_pid + key coverage check.
   resign-wechat
               Operator diagnostic path: quit WeChat, ad-hoc re-sign
               /Applications/WeChat.app, then reopen it. Bootstrap uses a
@@ -100,6 +99,7 @@ type scanFlags struct {
 	quiet          bool
 	config         string
 	includeBareHex bool
+	liveScan       bool
 }
 
 func parseFlags(args []string) scanFlags {
@@ -111,6 +111,8 @@ func parseFlags(args []string) scanFlags {
 			f.quiet = true
 		case a == "--bare-hex":
 			f.includeBareHex = true
+		case a == "--scan":
+			f.liveScan = true
 		case strings.HasPrefix(a, "--pid="):
 			n, err := strconv.Atoi(strings.TrimPrefix(a, "--pid="))
 			if err != nil {
@@ -273,7 +275,7 @@ func runScan(args []string, doSetup bool) {
 	chownToInvokingUser(cfgPath)
 	chownToDirOwner(cfgPath)
 	if len(out.Results) < len(saltIdx) {
-		fmt.Fprintf(os.Stderr, "[wxkey] WARNING: 部分 key 缺失 (%d/%d). 跑 `wxkey doctor` 看哪些 DB 没拿到 key, 通常是因为还没在 WeChat 里打开过那个聊天。\n",
+		fmt.Fprintf(os.Stderr, "[wxkey] WARNING: 部分 key 缺失 (%d/%d). Agent 应继续跑 `wxkey doctor` 轻量定位缺失 DB；只让用户在 WeChat 里打开对应聊天/页面，然后由 agent 重跑 `wxkey setup`。\n",
 			len(out.Results), len(saltIdx))
 	}
 	writeJSON(setupOutput{scanOutput: out, ConfigPath: cfgPath})
@@ -1126,7 +1128,7 @@ func runResignWeChat() {
 	fmt.Println("[4/4] Reopening WeChat...")
 	if err := exec.Command("/usr/bin/open", wechatAppPath).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "[WARN] open WeChat failed: %v\n", err)
-		fmt.Fprintln(os.Stderr, "       Open WeChat manually, wait for login, then run `wxkey setup`.")
+		fmt.Fprintln(os.Stderr, "       Ask the user to open WeChat manually and wait for login; then the agent should run `wxkey setup`.")
 		return
 	}
 
@@ -1169,8 +1171,9 @@ func startOrphanWatchdog() {
 	}()
 }
 
-// runDoctor is a read-only health check. It prints what's working, what's
-// missing, and (when run as root) the actual key coverage from a live scan.
+// runDoctor is a read-only health check. By default it compares the cached key
+// config against local DB salts, so partial-coverage diagnosis does not trigger
+// another slow memory scan. Pass --scan for the live task_for_pid/key check.
 // Does not write any config — safe to run any time.
 func runDoctor(args []string) {
 	f := parseFlags(args)
@@ -1254,9 +1257,40 @@ func runDoctor(args []string) {
 		logf("       放到 wx-mcp 旁边的 lib/ 目录或 ~/.config/wxcli/lib/\n")
 	}
 
+	cfgPath := f.config
+	if cfgPath == "" {
+		cfgPath = defaultConfigPath()
+	}
+	cfg, cfgOK := configReady(cfgPath)
+	if cfgOK {
+		logf("[OK]   key config: %s\n", cfgPath)
+		logf("       wxid=%s db_root=%s cached_keys=%d\n", cfg.WxID, cfg.DBRoot, len(cfg.Keys))
+		if cfg.DBRoot != "" && cfg.DBRoot != root {
+			logf("[WARN] key config db_root 与当前账号目录不同; cached coverage 可能不适用\n")
+		}
+		foundSalts := cachedFoundSalts(cfg.Keys, saltIdx)
+		if len(foundSalts) == len(saltIdx) {
+			logf("[OK]   Cached key 覆盖率: %d/%d (100%%) — 当前 DB salts 都有缓存 key\n",
+				len(foundSalts), len(saltIdx))
+		} else {
+			coverage := float64(len(foundSalts)) / float64(len(saltIdx)) * 100
+			logf("[WARN] Cached key 覆盖率: %d/%d (%.0f%%) — %d 个 DB salt 没有缓存 key\n",
+				len(foundSalts), len(saltIdx), coverage, len(saltIdx)-len(foundSalts))
+			printMissingDBs(logf, dbs, saltIdx, foundSalts)
+		}
+	} else {
+		logf("[WARN] key config 不存在或为空: %s\n", cfgPath)
+		logf("       Agent 应先跑 `wxkey bootstrap`; 若已存 sudo 凭据, 可跑 `wxkey setup` 写 config.\n")
+	}
+
+	if !f.liveScan {
+		logf("\n[INFO] 默认跳过实际内存 scan，避免重复等待。需要验证 task_for_pid/当前 heap 覆盖率时再跑 `wxkey doctor --scan`。\n")
+		return
+	}
+
 	if os.Geteuid() != 0 {
 		logf("\n[INFO] 未以 root 运行，跳过实际 scan\n")
-		logf("       完整诊断请先跑: wxkey bootstrap; 然后重试 wxkey doctor\n")
+		logf("       完整 live-scan 诊断请先跑: wxkey bootstrap; 然后重试 wxkey doctor --scan\n")
 		return
 	}
 
@@ -1285,13 +1319,30 @@ func runDoctor(args []string) {
 		logf("[OK]   Key 覆盖率: %d/%d (100%%) — 所有 DB 都拿到了 key\n",
 			len(results), len(saltIdx))
 		logf("\n=== 全部就绪 ===\n")
-		logf("跑 `wxkey setup` 写 config, 然后启动 wx-mcp\n")
+		logf("Agent 跑 `wxkey setup` 写 config, 然后启动 wx-mcp\n")
 		return
 	}
 
 	coverage := float64(len(results)) / float64(len(saltIdx)) * 100
 	logf("[WARN] Key 覆盖率: %d/%d (%.0f%%) — %d 个 DB 没拿到 key\n",
 		len(results), len(saltIdx), coverage, len(saltIdx)-len(results))
+	printMissingDBs(logf, dbs, saltIdx, foundSalts)
+	logf("\n=== 部分覆盖 ===\n")
+	logf("Agent 下一步: 提示用户只在 WeChat 里打开缺的聊天/朋友圈/收藏，触发 WCDB 加载那些 DB key，然后由 agent 重跑 `wxkey setup`\n")
+	logf("也可以暂时接受部分覆盖: 已拿到 key 的 DB 可继续支持大部分 wx-mcp 功能\n")
+}
+
+func cachedFoundSalts(keys map[string]string, saltIdx map[string][]int) map[string]bool {
+	found := make(map[string]bool)
+	for salt := range saltIdx {
+		if _, ok := keys[hex.EncodeToString([]byte(salt))]; ok {
+			found[salt] = true
+		}
+	}
+	return found
+}
+
+func printMissingDBs(logf func(string, ...any), dbs []dbfiles.DB, saltIdx map[string][]int, foundSalts map[string]bool) {
 	logf("\n       缺 key 的 DB (最常见原因: WeChat 里还没打开过这个聊天/页面):\n")
 	var missing []string
 	for salt, idxs := range saltIdx {
@@ -1306,9 +1357,6 @@ func runDoctor(args []string) {
 	for _, p := range missing {
 		logf("         - %s\n", p)
 	}
-	logf("\n=== 部分覆盖 ===\n")
-	logf("方案 1: 在 WeChat 里打开缺的聊天/朋友圈/收藏，触发 WCDB 加载那些 DB key，然后重跑\n")
-	logf("方案 2: 直接 `wxkey setup`，部分覆盖也能跑大部分 wx-mcp 功能\n")
 }
 
 // findBundledDylib hunts libWCDB.dylib in the same locations wx-mcp does.
