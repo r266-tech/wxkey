@@ -65,6 +65,8 @@ wxkey bootstrap
 
 不需要关闭 SIP。不要把 admin 密码、config.json、DB key 或微信数据库发到 issue、聊天窗口或 agent 对话里。
 
+默认 key scan 最长跑 3 分钟，超时会退出并保留清晰错误，不会在安装脚本里无限挂住。需要维护者调长时可设置 `WXKEY_SETUP_TIMEOUT=5m`。
+
 ## Agent 使用边界
 
 agent 可以自己跑 `wxkey doctor` / `wxkey setup` / `wxkey image-key`。如果覆盖不完整，agent 应该读取缺失 DB 列表，只让用户在微信里打开对应聊天、收藏或朋友圈页面，然后 agent 再重试。

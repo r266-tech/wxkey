@@ -1,6 +1,10 @@
 package verify
 
 import (
+	"crypto/hmac"
+	"crypto/pbkdf2"
+	"crypto/sha512"
+	"encoding/binary"
 	"encoding/hex"
 	"os"
 	"path/filepath"
@@ -61,4 +65,58 @@ func TestVerify_WrongKey(t *testing.T) {
 	if VerifyCandidate(bogus, page1[:PageSize]) != "" {
 		t.Fatal("bogus key unexpectedly verified")
 	}
+}
+
+func TestEncKeyForCandidateNormalizesPassword(t *testing.T) {
+	password := bytesOf("0123456789abcdef0123456789abcdef")
+	salt := bytesOf("1234567890abcdef")
+	page1 := buildSyntheticPage1(t, password, salt)
+
+	encKey, mode := EncKeyForCandidate(password, page1)
+	if mode != "password" {
+		t.Fatalf("EncKeyForCandidate mode = %q, want password", mode)
+	}
+	if len(encKey) != KeySize {
+		t.Fatalf("enc_key length = %d, want %d", len(encKey), KeySize)
+	}
+	if string(encKey) == string(password) {
+		t.Fatalf("password candidate was not normalized to derived enc_key")
+	}
+	if !VerifyAsEncKey(encKey, page1) {
+		t.Fatalf("normalized enc_key does not verify")
+	}
+}
+
+func bytesOf(s string) []byte {
+	return []byte(s)
+}
+
+func buildSyntheticPage1(t *testing.T, password, salt []byte) []byte {
+	t.Helper()
+	page1 := make([]byte, PageSize)
+	copy(page1, salt)
+	for i := SaltSize; i < PageSize-HMACSize; i++ {
+		page1[i] = byte(i)
+	}
+	encKey, err := pbkdf2.Key(sha512.New, string(password), salt, KDFIter, KeySize)
+	if err != nil {
+		t.Fatalf("derive test enc_key: %v", err)
+	}
+	fillPage1MAC(page1, encKey)
+	return page1
+}
+
+func fillPage1MAC(page1, encKey []byte) {
+	salt := page1[:SaltSize]
+	macSalt := make([]byte, SaltSize)
+	for i, b := range salt {
+		macSalt[i] = b ^ 0x3A
+	}
+	macKey, _ := pbkdf2.Key(sha512.New, string(encKey), macSalt, 2, KeySize)
+	h := hmac.New(sha512.New, macKey)
+	h.Write(page1[SaltSize : PageSize-HMACSize])
+	var pageNum [4]byte
+	binary.LittleEndian.PutUint32(pageNum[:], 1)
+	h.Write(pageNum[:])
+	copy(page1[PageSize-HMACSize:], h.Sum(nil))
 }

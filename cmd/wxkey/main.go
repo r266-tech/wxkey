@@ -5,9 +5,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	userpkg "os/user"
@@ -227,27 +230,36 @@ func runScan(args []string, doSetup bool) {
 	logf(f.quiet, "[wxkey] scanning pid=%d root=%s (%d dbs, %d unique salts)\n",
 		pid, root, len(dbs), len(saltIdx))
 
-	// WCDB v4 stores enc_keys in WeChat heap as bare 64-hex ASCII strings,
-	// not as `x'...'` SQL literals. setup must always enable bare-hex scanning
-	// or it finds zero keys. The flag remains overridable for `scan` alone
-	// (debugging — the wrapped-only pass is faster but useless for wx-mcp).
+	// Setup uses a two-pass scan: first the fast wrapped SQL literal pattern
+	// used by wx-cli/wechat-decrypt, then a slower bare-hex fallback within the
+	// same timeout budget. The standalone scan command keeps --bare-hex explicit
+	// for diagnostics.
 	includeBareHex := f.includeBareHex || doSetup
-	results, stats, err := scan.RunWithOptions(int32(pid), dbs, saltIdx,
-		scan.Options{IncludeBareHex: includeBareHex},
-		progressFn(f.quiet))
+	var results map[string]scan.Result
+	var stats scan.Stats
+	if doSetup {
+		results, stats, err = runSetupKeyScan(pid, dbs, saltIdx, setupTimeout(), f.quiet)
+	} else {
+		results, stats, err = runKeyScan(pid, dbs, saltIdx, scan.Options{IncludeBareHex: includeBareHex}, 0, f.quiet)
+	}
 	if err != nil {
-		// Auto-elevate on permission failure.
-		if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
-			logf(f.quiet, "[wxkey] task_for_pid denied; re-launching via stored sudo credential...\n")
-			if reErr := reExecElevated(); reErr != nil {
-				fail("%s", buildElevateFailHint(reErr, err))
+		if errors.Is(err, scan.ErrDeadlineExceeded) && doSetup && len(results) > 0 {
+			fmt.Fprintf(os.Stderr, "[wxkey] WARNING: scan timed out after %s; writing partial key coverage (%d/%d). Rerun `wxkey setup` after opening missing chats/pages in WeChat.\n",
+				stats.Elapsed.Round(time.Second), len(results), len(saltIdx))
+		} else {
+			// Auto-elevate on permission failure.
+			if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
+				logf(f.quiet, "[wxkey] task_for_pid denied; re-launching via stored sudo credential...\n")
+				if reErr := reExecElevated(); reErr != nil {
+					fail("%s", buildElevateFailHint(reErr, err))
+				}
+				return // child handled it
 			}
-			return // child handled it
+			if isPermissionErr(err) {
+				printPermissionAdvice(f.quiet, err)
+			}
+			fail("scan: %v", err)
 		}
-		if isPermissionErr(err) {
-			printPermissionAdvice(f.quiet, err)
-		}
-		fail("scan: %v", err)
 	}
 
 	wxid := filepath.Base(root)
@@ -292,6 +304,14 @@ func runScan(args []string, doSetup bool) {
 	for _, r := range out.Results {
 		keysMap[r.SaltHex] = r.KeyHex
 	}
+	existingCfg, hadExistingCfg := readWxcliConfig(cfgPath)
+	if hadExistingCfg && sameAccountConfig(existingCfg, wxid, root) {
+		for salt, key := range existingCfg.Keys {
+			if _, ok := keysMap[salt]; !ok {
+				keysMap[salt] = key
+			}
+		}
+	}
 
 	cfg := wxcliConfig{
 		SchemaVersion: 2,
@@ -303,6 +323,9 @@ func runScan(args []string, doSetup bool) {
 	if out.ImageKey != nil && out.ImageKey.Key != "" {
 		cfg.ImageKey = out.ImageKey.Key
 		cfg.ImageXORKey = out.ImageKey.XORKey
+	} else if hadExistingCfg && sameAccountConfig(existingCfg, wxid, root) {
+		cfg.ImageKey = existingCfg.ImageKey
+		cfg.ImageXORKey = existingCfg.ImageXORKey
 	}
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	data = append(data, '\n')
@@ -316,6 +339,58 @@ func runScan(args []string, doSetup bool) {
 			len(out.Results), len(saltIdx))
 	}
 	writeJSON(setupOutput{scanOutput: out, ConfigPath: cfgPath})
+}
+
+const defaultSetupTimeout = 3 * time.Minute
+
+func runSetupKeyScan(pid int, dbs []dbfiles.DB, saltIdx map[string][]int, timeout time.Duration, quiet bool) (map[string]scan.Result, scan.Stats, error) {
+	start := time.Now()
+	deadline := time.Time{}
+	if timeout > 0 {
+		deadline = start.Add(timeout)
+	}
+
+	logf(quiet, "[wxkey] pass 1/2: wrapped SQL literal scan\n")
+	results, stats, err := runKeyScan(pid, dbs, saltIdx, scan.Options{Deadline: deadline}, 0, quiet)
+	if err != nil && !errors.Is(err, scan.ErrDeadlineExceeded) {
+		return results, stats, err
+	}
+	if len(results) == len(saltIdx) || errors.Is(err, scan.ErrDeadlineExceeded) {
+		return results, stats, err
+	}
+
+	remainingBudget := time.Duration(0)
+	if !deadline.IsZero() {
+		remainingBudget = time.Until(deadline)
+		if remainingBudget <= 0 {
+			return results, stats, fmt.Errorf("%w after %s", scan.ErrDeadlineExceeded, time.Since(start).Round(time.Second))
+		}
+	}
+	logf(quiet, "[wxkey] pass 2/2: bare-hex fallback scan (remaining %s)\n", remainingBudget.Round(time.Second))
+	fallbackResults, fallbackStats, fallbackErr := runKeyScan(pid, dbs, saltIdx, scan.Options{IncludeBareHex: true, Deadline: deadline}, stats.Elapsed, quiet)
+	merged := mergeScanResults(results, fallbackResults)
+	fallbackStats.BytesScanned += stats.BytesScanned
+	fallbackStats.HexMatches += stats.HexMatches
+	fallbackStats.BareHexMatches += stats.BareHexMatches
+	fallbackStats.Verifications += stats.Verifications
+	fallbackStats.Found = len(merged)
+	fallbackStats.Elapsed = time.Since(start)
+	return merged, fallbackStats, fallbackErr
+}
+
+func runKeyScan(pid int, dbs []dbfiles.DB, saltIdx map[string][]int, opts scan.Options, elapsedOffset time.Duration, quiet bool) (map[string]scan.Result, scan.Stats, error) {
+	return scan.RunWithOptions(int32(pid), dbs, saltIdx, opts, offsetProgressFn(quiet, elapsedOffset))
+}
+
+func mergeScanResults(base, overlay map[string]scan.Result) map[string]scan.Result {
+	out := make(map[string]scan.Result, len(base)+len(overlay))
+	for salt, result := range base {
+		out[salt] = result
+	}
+	for salt, result := range overlay {
+		out[salt] = result
+	}
+	return out
 }
 
 func runListPids() {
@@ -463,7 +538,7 @@ func runBootstrap(args []string) {
 		return
 	}
 
-	fmt.Println("[INFO] Extracting keys and writing config...")
+	fmt.Printf("[INFO] Extracting keys and writing config (timeout %s)...\n", setupTimeout().Round(time.Second))
 	res, err := runSetupCaptured(setupFlags)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[wxkey] setup failed during bootstrap.\n")
@@ -500,6 +575,22 @@ func configReady(path string) (wxcliConfig, bool) {
 
 func configHasImageKey(cfg wxcliConfig) bool {
 	return strings.TrimSpace(cfg.ImageKey) != "" && cfg.ImageXORKey != nil
+}
+
+func readWxcliConfig(path string) (wxcliConfig, bool) {
+	var cfg wxcliConfig
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, false
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, false
+	}
+	return cfg, true
+}
+
+func sameAccountConfig(cfg wxcliConfig, wxid, root string) bool {
+	return cfg.WxID == wxid && filepath.Clean(cfg.DBRoot) == filepath.Clean(root)
 }
 
 func runSelfPassthrough(args ...string) error {
@@ -665,7 +756,7 @@ func runSetupCaptured(f scanFlags) (*setupOutput, error) {
 	if err != nil {
 		return nil, err
 	}
-	args := []string{"setup", "--quiet"}
+	args := []string{"setup"}
 	if f.pid > 0 {
 		args = append(args, "--pid", strconv.Itoa(f.pid))
 	}
@@ -675,12 +766,9 @@ func runSetupCaptured(f scanFlags) (*setupOutput, error) {
 	if f.config != "" {
 		args = append(args, "--config", f.config)
 	}
-	cmd := exec.Command(exe, args...)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, stderr, err := runChildCaptured(setupCommandTimeout(), exe, args...)
 	if err != nil {
-		msg := strings.TrimSpace(stderr.String())
+		msg := strings.TrimSpace(stderr)
 		if msg != "" {
 			return nil, fmt.Errorf("setup command failed: %w\n%s", err, msg)
 		}
@@ -709,12 +797,9 @@ func runImageKeyCaptured(f scanFlags) (*imageKeyCommandOutput, error) {
 	if f.root != "" {
 		args = append(args, "--root", f.root)
 	}
-	cmd := exec.Command(exe, args...)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, stderr, err := runChildCaptured(75*time.Second, exe, args...)
 	if err != nil {
-		msg := strings.TrimSpace(stderr.String())
+		msg := strings.TrimSpace(stderr)
 		if msg != "" {
 			return nil, fmt.Errorf("image-key command failed: %w\n%s", err, msg)
 		}
@@ -729,6 +814,77 @@ func runImageKeyCaptured(f scanFlags) (*imageKeyCommandOutput, error) {
 		return nil, fmt.Errorf("parse image-key output: %w (stdout %d bytes)", err, len(out))
 	}
 	return &res, nil
+}
+
+func setupTimeout() time.Duration {
+	for _, name := range []string{"WXKEY_SETUP_TIMEOUT", "WXKEY_SCAN_TIMEOUT"} {
+		raw := strings.TrimSpace(os.Getenv(name))
+		if raw == "" {
+			continue
+		}
+		d, err := time.ParseDuration(raw)
+		if err == nil {
+			return d
+		}
+		if sec, secErr := strconv.Atoi(raw); secErr == nil {
+			return time.Duration(sec) * time.Second
+		}
+	}
+	return defaultSetupTimeout
+}
+
+func setupCommandTimeout() time.Duration {
+	scanTimeout := setupTimeout()
+	if scanTimeout <= 0 {
+		return 0
+	}
+	return scanTimeout + 30*time.Second
+}
+
+func runChildCaptured(timeout time.Duration, exe string, args ...string) ([]byte, string, error) {
+	cmd := exec.Command(exe, args...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return nil, "", err
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	if timeout <= 0 {
+		err := <-done
+		return stdout.Bytes(), stderr.String(), err
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return stdout.Bytes(), stderr.String(), err
+	case <-timer.C:
+		killProcessGroup(cmd.Process.Pid)
+		err := <-done
+		if err == nil {
+			err = fmt.Errorf("command exited after timeout")
+		}
+		return stdout.Bytes(), stderr.String(), fmt.Errorf("timed out after %s: %w", timeout.Round(time.Second), err)
+	}
+}
+
+func killProcessGroup(pid int) {
+	if pid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	time.Sleep(750 * time.Millisecond)
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
 func writeImageKeyToConfig(path, key string, xorKey *int) error {
@@ -887,6 +1043,10 @@ func collapseResults(results map[string]scan.Result) []scan.Result {
 }
 
 func progressFn(quiet bool) scan.ProgressFn {
+	return offsetProgressFn(quiet, 0)
+}
+
+func offsetProgressFn(quiet bool, elapsedOffset time.Duration) scan.ProgressFn {
 	if quiet {
 		return nil
 	}
@@ -896,6 +1056,7 @@ func progressFn(quiet bool) scan.ProgressFn {
 			return
 		}
 		last = time.Now()
+		s.Elapsed += elapsedOffset
 		fmt.Fprintf(os.Stderr, "[wxkey] scanned %.0f MB / %d regions, %d hits, %d verified, found=%d\n",
 			float64(s.BytesScanned)/1024/1024, s.Regions, s.HexMatches, s.Verifications, s.Found)
 	}
@@ -1058,6 +1219,16 @@ func sudoCommandWithPassword(password string, args ...string) *exec.Cmd {
 // buildElevateFailHint composes an actionable hint when stored-sudo
 // auto-elevation fails.
 func buildElevateFailHint(reErr, origErr error) string {
+	if strings.Contains(reErr.Error(), "scan deadline exceeded") || strings.Contains(reErr.Error(), "no keys found") {
+		var b strings.Builder
+		fmt.Fprintf(&b, "elevated key scan failed: %v\n", reErr)
+		fmt.Fprintln(&b, "")
+		fmt.Fprintln(&b, "       The stored-sudo/task_for_pid route worked, but wxkey did not find a")
+		fmt.Fprintln(&b, "       usable DB key before the scan finished. Keep WeChat open, open one")
+		fmt.Fprintln(&b, "       chat/page that needs decrypting, then rerun `wxkey setup` or")
+		fmt.Fprintln(&b, "       `wxkey bootstrap`. Do not disable SIP.")
+		return b.String()
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "auto-elevate via stored sudo credential failed: %v\n", reErr)
 	fmt.Fprintf(&b, "       original permission error: %v\n", origErr)
@@ -1241,13 +1412,36 @@ func reExecElevated() error {
 		"WXKEY_ELEVATED=1",
 		"WXKEY_ORIG_HOME=" + origHome,
 		"WXKEY_ORIG_USER=" + origUser,
-		exe,
 	}
+	for _, name := range []string{"WXKEY_SETUP_TIMEOUT", "WXKEY_SCAN_TIMEOUT"} {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			args = append(args, name+"="+value)
+		}
+	}
+	args = append(args, exe)
 	args = append(args, os.Args[1:]...)
 	cmd := sudoCommandWithPassword(pw, args...)
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	var stderr strings.Builder
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
+	if err := cmd.Run(); err != nil {
+		if tail := tailLines(stderr.String(), 8); tail != "" {
+			return fmt.Errorf("%w\n%s", err, tail)
+		}
+		return err
+	}
+	return nil
+}
+
+func tailLines(s string, n int) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) == 0 || (len(lines) == 1 && strings.TrimSpace(lines[0]) == "") {
+		return ""
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func runResignWeChat() {

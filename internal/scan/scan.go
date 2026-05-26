@@ -14,6 +14,7 @@
 package scan
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"time"
@@ -49,12 +50,17 @@ const overlap = 256
 // caches or the dyld closure mapped at full virtual size).
 const MaxRegionSize = 500 * 1024 * 1024
 
-// Result describes one matched (db, key) pair.
+// ErrDeadlineExceeded reports a caller-supplied scan deadline. Results may be
+// partial when this is returned.
+var ErrDeadlineExceeded = errors.New("scan deadline exceeded")
+
+// Result describes one matched (db, key) pair. VerifyAs records which in-memory
+// representation matched; KeyHex is always normalized to the post-PBKDF2 enc_key.
 type Result struct {
 	DBRel    string `json:"db_rel"`    // db path relative to scan root
 	DBPath   string `json:"db_path"`   // absolute db path
 	SaltHex  string `json:"salt_hex"`  // 32-hex db salt
-	KeyHex   string `json:"key_hex"`   // 64-hex master key
+	KeyHex   string `json:"key_hex"`   // 64-hex post-PBKDF2 enc_key
 	VerifyAs string `json:"verify_as"` // "password" or "enc_key"
 }
 
@@ -81,6 +87,10 @@ type Options struct {
 	// it as a plain std::string, but each candidate costs one 256000-round
 	// PBKDF2 to verify. Only enable when needed (e.g. Plan-C investigation).
 	IncludeBareHex bool
+
+	// Deadline stops long heap scans before an installer or agent call appears
+	// hung. A zero value means no deadline.
+	Deadline time.Time
 }
 
 // Run scans pid's memory for keys decrypting any of dbs. It stops as soon as
@@ -94,6 +104,14 @@ func Run(pid int32, dbs []dbfiles.DB, saltIdx map[string][]int, progress Progres
 func RunWithOptions(pid int32, dbs []dbfiles.DB, saltIdx map[string][]int, opts Options, progress ProgressFn) (map[string]Result, Stats, error) {
 	start := time.Now()
 	var stats Stats
+	finish := func(results map[string]Result, err error) (map[string]Result, Stats, error) {
+		stats.Found = len(results)
+		stats.Elapsed = time.Since(start)
+		return results, stats, err
+	}
+	deadlineExceeded := func() bool {
+		return !opts.Deadline.IsZero() && time.Now().After(opts.Deadline)
+	}
 
 	if len(dbs) == 0 {
 		return nil, stats, fmt.Errorf("scan.Run: no DBs to verify against")
@@ -160,6 +178,9 @@ func RunWithOptions(pid int32, dbs []dbfiles.DB, saltIdx map[string][]int, opts 
 
 			matches := hexLitRe.FindAllSubmatchIndex(view, -1)
 			for _, m := range matches {
+				if deadlineExceeded() {
+					return finish(results, fmt.Errorf("%w after %s", ErrDeadlineExceeded, time.Since(start).Round(time.Second)))
+				}
 				stats.HexMatches++
 				hex := view[m[2]:m[3]]
 				if processed := tryCandidate(hex, dbs, saltIdx, remaining, results, &stats); processed {
@@ -172,6 +193,9 @@ func RunWithOptions(pid int32, dbs []dbfiles.DB, saltIdx map[string][]int, opts 
 			if opts.IncludeBareHex && len(remaining) > 0 {
 				bare := bareHexRe.FindAllSubmatchIndex(view, -1)
 				for _, m := range bare {
+					if deadlineExceeded() {
+						return finish(results, fmt.Errorf("%w after %s", ErrDeadlineExceeded, time.Since(start).Round(time.Second)))
+					}
 					stats.BareHexMatches++
 					hex := view[m[2]:m[3]]
 					if processed := tryCandidate(hex, dbs, saltIdx, remaining, results, &stats); processed {
@@ -196,15 +220,16 @@ func RunWithOptions(pid int32, dbs []dbfiles.DB, saltIdx map[string][]int, opts 
 				progress(stats)
 			}
 
+			if deadlineExceeded() {
+				return finish(results, fmt.Errorf("%w after %s", ErrDeadlineExceeded, time.Since(start).Round(time.Second)))
+			}
 			if len(remaining) == 0 {
 				break
 			}
 		}
 	}
 
-	stats.Found = len(results)
-	stats.Elapsed = time.Since(start)
-	return results, stats, nil
+	return finish(results, nil)
 }
 
 // tryCandidate parses a hex literal match, verifies it against the right DBs,
@@ -232,12 +257,12 @@ func tryCandidate(hexBytes []byte, dbs []dbfiles.DB, saltIdx map[string][]int,
 				if _, still := remaining[string(saltBytes)]; still {
 					for _, di := range dbIdxs {
 						stats.Verifications++
-						if mode := verify.VerifyCandidate(keyBytes, dbs[di].Page1); mode != "" {
+						if encKey, mode := verify.EncKeyForCandidate(keyBytes, dbs[di].Page1); mode != "" {
 							results[string(saltBytes)] = Result{
 								DBRel:    dbs[di].Rel,
 								DBPath:   dbs[di].Path,
 								SaltHex:  saltHex,
-								KeyHex:   keyHex,
+								KeyHex:   hex32(encKey),
 								VerifyAs: mode,
 							}
 							delete(remaining, string(saltBytes))
@@ -256,12 +281,12 @@ func tryCandidate(hexBytes []byte, dbs []dbfiles.DB, saltIdx map[string][]int,
 			dbIdxs := saltIdx[saltStr]
 			for _, di := range dbIdxs {
 				stats.Verifications++
-				if mode := verify.VerifyCandidate(keyBytes, dbs[di].Page1); mode != "" {
+				if encKey, mode := verify.EncKeyForCandidate(keyBytes, dbs[di].Page1); mode != "" {
 					results[saltStr] = Result{
 						DBRel:    dbs[di].Rel,
 						DBPath:   dbs[di].Path,
 						SaltHex:  hex32(dbs[di].Salt),
-						KeyHex:   keyHex,
+						KeyHex:   hex32(encKey),
 						VerifyAs: mode,
 					}
 					delete(remaining, saltStr)

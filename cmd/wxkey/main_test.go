@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/r266-tech/wxkey/internal/scan"
 )
 
 func TestClassifyWeChatSignatureAdHoc(t *testing.T) {
@@ -105,6 +107,31 @@ func TestWriteImageKeyToConfigPreservesDBKeys(t *testing.T) {
 	}
 	if got.ImageKey != "abcdefghijklmnop" || got.ImageXORKey == nil || *got.ImageXORKey != 240 || got.Keys["salt"] != "enc" || got.KeyEpoch != 123 {
 		t.Fatalf("config after image_key write = %#v", got)
+	}
+}
+
+func TestMergeScanResultsKeepsWrappedPassResults(t *testing.T) {
+	base := map[string]scan.Result{
+		"salt_a": {SaltHex: "salt_a", KeyHex: "key_a", VerifyAs: "enc_key"},
+		"salt_b": {SaltHex: "salt_b", KeyHex: "key_b", VerifyAs: "enc_key"},
+	}
+	overlay := map[string]scan.Result{
+		"salt_b": {SaltHex: "salt_b", KeyHex: "new_key_b", VerifyAs: "password"},
+		"salt_c": {SaltHex: "salt_c", KeyHex: "key_c", VerifyAs: "enc_key"},
+	}
+	got := mergeScanResults(base, overlay)
+	if got["salt_a"].KeyHex != "key_a" || got["salt_b"].KeyHex != "new_key_b" || got["salt_c"].KeyHex != "key_c" {
+		t.Fatalf("merged scan results = %#v", got)
+	}
+}
+
+func TestSameAccountConfigCleansRoot(t *testing.T) {
+	cfg := wxcliConfig{WxID: "wxid_test", DBRoot: "/tmp/root/../root"}
+	if !sameAccountConfig(cfg, "wxid_test", "/tmp/root") {
+		t.Fatalf("sameAccountConfig should match cleaned roots")
+	}
+	if sameAccountConfig(cfg, "other", "/tmp/root") {
+		t.Fatalf("sameAccountConfig matched wrong wxid")
 	}
 }
 

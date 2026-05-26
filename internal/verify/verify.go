@@ -12,9 +12,10 @@
 //	enc_key = PBKDF2-HMAC-SHA512(password, salt,           iter=KDFIter, dklen=32)
 //	mac_key = PBKDF2-HMAC-SHA512(enc_key,  salt XOR 0x3A,  iter=2,       dklen=32)
 //
-// `password` is what callers pass to sqlite3_key_v2. When wx-mcp stashes the
-// 64-hex "key" in its config, that hex is the password (NOT the post-KDF
-// enc_key) — WCDB still runs the 256000-round PBKDF2 internally on each open.
+// `password` is what callers pass to sqlite3_key_v2. wxkey normalizes any
+// verified password candidate to the post-KDF enc_key before writing config, so
+// wx-mcp/wechat-cli can use SQLCipher's raw-key path without rerunning the
+// 256000-round PBKDF2 on every DB open.
 //
 // Memory may hold the candidate as either the password or the enc_key,
 // depending on which lifecycle stage we catch. VerifyCandidate tries both.
@@ -61,16 +62,43 @@ func VerifyAsEncKey(candidate, page1 []byte) bool {
 	return verifyMAC(candidate, page1)
 }
 
+// EncKeyForCandidate runs both interpretations and returns the post-KDF enc_key
+// that callers can pass through SQLCipher's raw-key path. Cheap path runs first.
+func EncKeyForCandidate(candidate, page1 []byte) ([]byte, string) {
+	if VerifyAsEncKey(candidate, page1) {
+		out := make([]byte, len(candidate))
+		copy(out, candidate)
+		return out, "enc_key"
+	}
+	encKey, ok := DeriveEncKey(candidate, page1)
+	if ok {
+		return encKey, "password"
+	}
+	return nil, ""
+}
+
 // VerifyCandidate runs both interpretations and returns the matching mode
 // ("password" or "enc_key") on success, "" on failure. Cheap path runs first.
 func VerifyCandidate(candidate, page1 []byte) string {
-	if VerifyAsEncKey(candidate, page1) {
-		return "enc_key"
+	_, mode := EncKeyForCandidate(candidate, page1)
+	return mode
+}
+
+// DeriveEncKey treats candidate as the user-supplied SQLCipher password and
+// returns the derived enc_key if it verifies page 1.
+func DeriveEncKey(candidate, page1 []byte) ([]byte, bool) {
+	if len(candidate) != KeySize || len(page1) < PageSize {
+		return nil, false
 	}
-	if VerifyAsPassword(candidate, page1) {
-		return "password"
+	salt := page1[:SaltSize]
+	encKey, err := pbkdf2.Key(sha512.New, string(candidate), salt, KDFIter, KeySize)
+	if err != nil {
+		return nil, false
 	}
-	return ""
+	if !verifyMAC(encKey, page1) {
+		return nil, false
+	}
+	return encKey, true
 }
 
 func verifyMAC(encKey, page1 []byte) bool {
