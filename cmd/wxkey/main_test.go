@@ -1,6 +1,16 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"crypto/aes"
+	"crypto/md5"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestClassifyWeChatSignatureAdHoc(t *testing.T) {
 	st := classifyWeChatSignature(`Executable=/Applications/WeChat.app/Contents/MacOS/WeChat
@@ -49,5 +59,123 @@ func TestPathInsideApp(t *testing.T) {
 	other := "/Applications/WeChat.app/Contents/MacOS/WeChat"
 	if pathInsideApp(other, app) {
 		t.Fatalf("did not expect original app process to match shadow app")
+	}
+}
+
+func TestConfigHasImageKey(t *testing.T) {
+	if configHasImageKey(wxcliConfig{ImageKey: "   "}) {
+		t.Fatalf("blank image key should not be ready")
+	}
+	if configHasImageKey(wxcliConfig{ImageKey: "abcdefghijklmnop"}) {
+		t.Fatalf("image key without xor key should be refreshed")
+	}
+	xorKey := 240
+	if !configHasImageKey(wxcliConfig{ImageKey: "abcdefghijklmnop", ImageXORKey: &xorKey}) {
+		t.Fatalf("non-empty image key with xor key should be ready")
+	}
+}
+
+func TestWriteImageKeyToConfigPreservesDBKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := wxcliConfig{
+		SchemaVersion: 2,
+		WxID:          "wxid_test",
+		DBRoot:        "/tmp/root",
+		Keys:          map[string]string{"salt": "enc"},
+		KeyEpoch:      123,
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	xorKey := 240
+	if err := writeImageKeyToConfig(path, "  abcdefghijklmnop  ", &xorKey); err != nil {
+		t.Fatal(err)
+	}
+	var got wxcliConfig
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ImageKey != "abcdefghijklmnop" || got.ImageXORKey == nil || *got.ImageXORKey != 240 || got.Keys["salt"] != "enc" || got.KeyEpoch != 123 {
+		t.Fatalf("config after image_key write = %#v", got)
+	}
+}
+
+func TestDeriveImageKeyFromDiskUsesKVComm(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("WXKEY_ORIG_HOME", home)
+	root := filepath.Join(home, "Library", "Containers", "com.tencent.xinWeChat", "Data", "Documents", "xwechat_files", "wxid_test_abcd")
+	imgDir := filepath.Join(root, "msg", "attach", "chat", "2026-05", "Img")
+	if err := os.MkdirAll(imgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	kvcomm := filepath.Join(home, "Library", "Containers", "com.tencent.xinWeChat", "Data", "Documents", "app_data", "net", "kvcomm")
+	if err := os.MkdirAll(kvcomm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code := uint32(2270404336)
+	if err := os.WriteFile(filepath.Join(kvcomm, fmt.Sprintf("key_%d_test.statistic", code)), []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	key := deriveImageKeyFromKVCode(code, "wxid_test")
+	datPath := filepath.Join(imgDir, "sample_t.dat")
+	if err := os.WriteFile(datPath, testImageKeyV2DAT(t, []byte(key), byte(code&0xff), []byte{0xff, 0xd8, 0xff, 0xe0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tpl, err := findImageKeyTemplate(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := deriveImageKeyFromDisk(root, tpl, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Key != key {
+		t.Fatalf("derived key = %q, want %q", got.Key, key)
+	}
+	if got.XORKey == nil || *got.XORKey != int(code&0xff) {
+		t.Fatalf("derived xor_key = %#v, want %d", got.XORKey, code&0xff)
+	}
+	if got.TemplateSource != "kvcomm_t.dat" || got.Regions != 0 || got.BytesScanned != 0 {
+		t.Fatalf("disk-derived metadata = %#v", got)
+	}
+}
+
+func testImageKeyV2DAT(t *testing.T, key []byte, xorKey byte, plain []byte) []byte {
+	t.Helper()
+	block, err := aes.NewCipher(key[:aes.BlockSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	padding := aes.BlockSize - len(plain)%aes.BlockSize
+	padded := append(append([]byte{}, plain...), bytes.Repeat([]byte{byte(padding)}, padding)...)
+	encrypted := make([]byte, len(padded))
+	for start := 0; start < len(padded); start += aes.BlockSize {
+		block.Encrypt(encrypted[start:start+aes.BlockSize], padded[start:start+aes.BlockSize])
+	}
+	header := make([]byte, 15)
+	copy(header, wechatV4ImageHeader2ForTest)
+	binary.LittleEndian.PutUint32(header[6:10], uint32(len(plain)))
+	binary.LittleEndian.PutUint32(header[10:14], 2)
+	header[14] = 1
+	return append(append(header, encrypted...), 0xff^xorKey, 0xd9^xorKey)
+}
+
+var wechatV4ImageHeader2ForTest = []byte{0x07, 0x08, 0x56, 0x32, 0x08, 0x07}
+
+func TestDeriveImageKeyFromKVCode(t *testing.T) {
+	got := deriveImageKeyFromKVCode(42, "your_wxid")
+	sum := md5.Sum([]byte("42your_wxid"))
+	want := fmt.Sprintf("%x", sum)[:aes.BlockSize]
+	if got != want {
+		t.Fatalf("deriveImageKeyFromKVCode = %q, want %q", got, want)
 	}
 }

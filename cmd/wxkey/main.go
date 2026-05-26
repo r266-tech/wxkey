@@ -26,7 +26,8 @@ const usage = `wxkey - extract WeChat 4.x WCDB master keys (macOS)
 
 Usage:
   wxkey bootstrap  [--root /path/to/xwechat_files/<wxid>] [--config ~/.config/wxcli/config.json]
-  wxkey scan       [--pid N] [--root /path/to/xwechat_files/<wxid>] [--quiet]
+  wxkey scan       [--pid N] [--root /path/to/xwechat_files/<wxid>] [--quiet] [--image-key]
+  wxkey image-key  [--pid N] [--root /path/to/xwechat_files/<wxid>] [--quiet]
   wxkey setup      [--pid N] [--root ...] [--config ~/.config/wxcli/config.json]
   wxkey doctor     [--pid N] [--root ...] [--config ...] [--quiet] [--scan]
   wxkey resign-wechat
@@ -37,12 +38,18 @@ Subcommands:
   bootstrap   One-command first-run setup for humans/agents: checks existing
               config, prepares an ad-hoc signed wx-mcp shadow copy of WeChat
               when needed, runs setup, and only prints a summary (not key
-              material).
+              material). Existing DB-key config still continues when image_key
+              is missing, so local image decode can be repaired.
   scan        Scan WeChat memory and print JSON: {pid, root, stats, results[]}.
               results[] entries map a DB salt to its 64-hex master key.
+  image-key   Derive the WeChat V4 local image_key from macOS kvcomm cache and
+              a local *_t.dat validation sample; falls back to memory scan if
+              disk derivation cannot verify a key. This does not read/write DB keys.
   setup       Like scan, but also writes ~/.config/wxcli/config.json so wx-mcp
               can pick up the key on next start. Picks the most populated DB
               under root to publish (typically contact.db or message db).
+              Also best-effort scans a WeChat V4 image_key when a *_t.dat
+              validation sample exists, so wx-mcp can decode local image .dat.
   doctor      Read-only health check: WeChat process, account dir, DB count,
               libWCDB.dylib presence, and cached key coverage from config.
               It does not scan memory by default; pass --scan for the slower
@@ -78,6 +85,8 @@ func main() {
 		runBootstrap(os.Args[2:])
 	case "scan":
 		runScan(os.Args[2:], false)
+	case "image-key":
+		runImageKey(os.Args[2:])
 	case "setup":
 		runScan(os.Args[2:], true)
 	case "doctor":
@@ -100,6 +109,7 @@ type scanFlags struct {
 	config         string
 	includeBareHex bool
 	liveScan       bool
+	imageKey       bool
 }
 
 func parseFlags(args []string) scanFlags {
@@ -111,6 +121,8 @@ func parseFlags(args []string) scanFlags {
 			f.quiet = true
 		case a == "--bare-hex":
 			f.includeBareHex = true
+		case a == "--image-key":
+			f.imageKey = true
 		case a == "--scan":
 			f.liveScan = true
 		case strings.HasPrefix(a, "--pid="):
@@ -153,16 +165,25 @@ func parseFlags(args []string) scanFlags {
 }
 
 type scanOutput struct {
-	PID     int           `json:"pid"`
-	Root    string        `json:"scan_root"`
-	WxID    string        `json:"wxid"`
-	Stats   scan.Stats    `json:"stats"`
-	Results []scan.Result `json:"results"`
+	PID           int             `json:"pid"`
+	Root          string          `json:"scan_root"`
+	WxID          string          `json:"wxid"`
+	Stats         scan.Stats      `json:"stats"`
+	Results       []scan.Result   `json:"results"`
+	ImageKey      *imageKeyOutput `json:"image_key,omitempty"`
+	ImageKeyError string          `json:"image_key_error,omitempty"`
 }
 
 type setupOutput struct {
 	scanOutput
 	ConfigPath string `json:"config_path,omitempty"`
+}
+
+type imageKeyCommandOutput struct {
+	PID      int             `json:"pid"`
+	Root     string          `json:"scan_root"`
+	WxID     string          `json:"wxid"`
+	ImageKey *imageKeyOutput `json:"image_key,omitempty"`
 }
 
 // wxcliConfig is the on-disk schema written to ~/.config/wxcli/config.json
@@ -175,6 +196,8 @@ type wxcliConfig struct {
 	WxID          string            `json:"wxid"`
 	DBRoot        string            `json:"db_root"`
 	Keys          map[string]string `json:"keys"`
+	ImageKey      string            `json:"image_key,omitempty"`
+	ImageXORKey   *int              `json:"image_xor_key,omitempty"`
 	KeyEpoch      int64             `json:"key_epoch"`
 }
 
@@ -237,6 +260,16 @@ func runScan(args []string, doSetup bool) {
 		Results: collapseResults(results),
 	}
 
+	if doSetup || f.imageKey {
+		img, err := scanImageKey(pid, root, f.quiet)
+		if err != nil {
+			out.ImageKeyError = err.Error()
+			logf(f.quiet, "[wxkey] image_key scan skipped/failed: %v\n", err)
+		} else {
+			out.ImageKey = img
+		}
+	}
+
 	if !doSetup {
 		writeJSON(out)
 		return
@@ -267,6 +300,10 @@ func runScan(args []string, doSetup bool) {
 		Keys:          keysMap,
 		KeyEpoch:      time.Now().Unix(),
 	}
+	if out.ImageKey != nil && out.ImageKey.Key != "" {
+		cfg.ImageKey = out.ImageKey.Key
+		cfg.ImageXORKey = out.ImageKey.XORKey
+	}
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	data = append(data, '\n')
 	if err := os.WriteFile(cfgPath, data, 0o600); err != nil {
@@ -291,6 +328,39 @@ func runListPids() {
 	}
 }
 
+func runImageKey(args []string) {
+	f := parseFlags(args)
+	pid := f.pid
+	root := f.root
+	if root == "" {
+		r, err := pickAccountRoot()
+		if err != nil {
+			fail("%v", err)
+		}
+		root = r
+	}
+	img, err := scanImageKey(pid, root, f.quiet)
+	if err != nil {
+		if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
+			logf(f.quiet, "[wxkey] task_for_pid denied; re-launching via stored sudo credential...\n")
+			if reErr := reExecElevated(); reErr != nil {
+				fail("%s", buildElevateFailHint(reErr, err))
+			}
+			return
+		}
+		if isPermissionErr(err) {
+			printPermissionAdvice(f.quiet, err)
+		}
+		fail("image-key scan: %v", err)
+	}
+	writeJSON(imageKeyCommandOutput{
+		PID:      pid,
+		Root:     root,
+		WxID:     filepath.Base(root),
+		ImageKey: img,
+	})
+}
+
 func runBootstrap(args []string) {
 	f := parseFlags(args)
 	cfgPath := f.config
@@ -300,16 +370,34 @@ func runBootstrap(args []string) {
 	if err := ensureStoredSudoPassword(); err != nil {
 		fail("prepare stored sudo credential: %v", err)
 	}
+	var existingCfg wxcliConfig
+	existingReady := false
+	printedHeader := false
 	if cfg, ok := configReady(cfgPath); ok {
+		existingCfg = cfg
+		existingReady = true
 		fmt.Println("=== wxkey bootstrap ===")
+		printedHeader = true
 		fmt.Printf("[OK] key config already exists: %s\n", cfgPath)
 		fmt.Printf("     wxid=%s db_root=%s keys=%d\n", cfg.WxID, cfg.DBRoot, len(cfg.Keys))
 		fmt.Println("     sudo credential is stored in macOS Keychain; wx-mcp can refresh keys without SIP.")
-		return
+		if configHasImageKey(cfg) {
+			return
+		}
+		fmt.Println("[INFO] image_key is missing; continuing bootstrap to refresh image decoding key.")
 	}
 
-	fmt.Println("=== wxkey bootstrap ===")
-	fmt.Println("[INFO] Goal: prepare ~/.config/wxcli/config.json with SIP enabled.")
+	if !printedHeader {
+		fmt.Println("=== wxkey bootstrap ===")
+	}
+	if existingReady {
+		fmt.Println("[INFO] Goal: refresh image_key in existing config with SIP enabled.")
+		if f.root == "" {
+			f.root = existingCfg.DBRoot
+		}
+	} else {
+		fmt.Println("[INFO] Goal: prepare ~/.config/wxcli/config.json with SIP enabled.")
+	}
 	fmt.Println("[INFO] Admin password is stored once in macOS Keychain for unattended future setup/refresh.")
 
 	if _, err := os.Stat(wechatAppPath); err != nil {
@@ -352,6 +440,29 @@ func runBootstrap(args []string) {
 		fail("%v", err)
 	}
 
+	if existingReady {
+		fmt.Println("[INFO] Extracting image_key and updating config...")
+		res, err := runImageKeyCaptured(setupFlags)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[wxkey] image_key refresh failed during bootstrap.\n")
+			fmt.Fprintf(os.Stderr, "        Open an image in WeChat so a *_t.dat sample exists, then rerun `wxkey bootstrap`.\n")
+			fail("%v", err)
+		}
+		if res.ImageKey == nil || res.ImageKey.Key == "" {
+			fail("image-key command returned no image_key")
+		}
+		if err := writeImageKeyToConfig(cfgPath, res.ImageKey.Key, res.ImageKey.XORKey); err != nil {
+			fail("write image_key config: %v", err)
+		}
+		fmt.Println("[OK]   image_key config updated")
+		fmt.Printf("       config: %s\n", cfgPath)
+		fmt.Printf("       wxid: %s\n", existingCfg.WxID)
+		fmt.Printf("       db_root: %s\n", existingCfg.DBRoot)
+		fmt.Println("")
+		fmt.Println("Done. wx-mcp can now decode local WeChat V4 image .dat into readable image paths.")
+		return
+	}
+
 	fmt.Println("[INFO] Extracting keys and writing config...")
 	res, err := runSetupCaptured(setupFlags)
 	if err != nil {
@@ -385,6 +496,10 @@ func configReady(path string) (wxcliConfig, bool) {
 		return cfg, false
 	}
 	return cfg, cfg.DBRoot != "" && len(cfg.Keys) > 0
+}
+
+func configHasImageKey(cfg wxcliConfig) bool {
+	return strings.TrimSpace(cfg.ImageKey) != "" && cfg.ImageXORKey != nil
 }
 
 func runSelfPassthrough(args ...string) error {
@@ -580,6 +695,64 @@ func runSetupCaptured(f scanFlags) (*setupOutput, error) {
 		return nil, fmt.Errorf("parse setup output: %w (stdout %d bytes)", err, len(out))
 	}
 	return &res, nil
+}
+
+func runImageKeyCaptured(f scanFlags) (*imageKeyCommandOutput, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"image-key", "--quiet"}
+	if f.pid > 0 {
+		args = append(args, "--pid", strconv.Itoa(f.pid))
+	}
+	if f.root != "" {
+		args = append(args, "--root", f.root)
+	}
+	cmd := exec.Command(exe, args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("image-key command failed: %w\n%s", err, msg)
+		}
+		return nil, fmt.Errorf("image-key command failed: %w", err)
+	}
+	payload := string(out)
+	if i := strings.IndexByte(payload, '{'); i >= 0 {
+		payload = payload[i:]
+	}
+	var res imageKeyCommandOutput
+	if err := json.Unmarshal([]byte(payload), &res); err != nil {
+		return nil, fmt.Errorf("parse image-key output: %w (stdout %d bytes)", err, len(out))
+	}
+	return &res, nil
+}
+
+func writeImageKeyToConfig(path, key string, xorKey *int) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var cfg wxcliConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return err
+	}
+	cfg.ImageKey = strings.TrimSpace(key)
+	cfg.ImageXORKey = xorKey
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		return err
+	}
+	chownToInvokingUser(path)
+	chownToDirOwner(path)
+	return nil
 }
 
 func effectiveUserHome() string {
