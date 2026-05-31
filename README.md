@@ -1,26 +1,26 @@
 # wxkey
 
-**macOS WeChat 4.x key bootstrap companion for [wx-mcp](https://github.com/r266-tech/wechat-local-mcp).**
+**macOS WeChat 4.x key bootstrap companion for [wechat-cli](https://github.com/r266-tech/wechat-cli).**
 
-`wxkey` 负责在 macOS 上初始化和刷新本机微信 WCDB 解密 key。普通用户通常不需要单独安装它：`wx-mcp` 的 release zip 已经内置 `wxkey`，一行安装会自动调用。
+`wxkey` 负责在 macOS 上初始化和刷新本机微信 WCDB 解密 key。普通用户通常不需要单独安装它：`wechat-cli` 的 release zip 已经内置 `wxkey`，一行安装会自动调用。
 
-Windows 用户不需要 `wxkey`。Windows 版 `wx-mcp` 会直接扫描当前用户登录的 WeChat / Weixin 进程并写入 key map。
+Windows 用户不需要 `wxkey`。Windows 版 `wechat-cli` 会直接扫描当前用户登录的 WeChat / Weixin 进程并写入 key map。
 
 ## 它做什么
 
 - 扫描本机 macOS WeChat 4.x 进程，提取候选 WCDB key。
 - 用本地数据库 page-1 HMAC 验证候选 key，避免写入错误 key。
-- 把 per-DB key map 写到 `~/.config/wxcli/config.json`，供 `wx-mcp` 只读打开加密数据库。
-- 在首次 bootstrap 时准备 wx-mcp 管理的 shadow WeChat，走无需关闭 SIP 的路线完成 `task_for_pid`。
+- 把 per-DB key map 写到 `~/.config/wxcli/config.json`，供 `wechat-cli` 只读打开加密数据库。
+- 在首次 bootstrap 时准备 wechat-cli 管理的 shadow WeChat，走无需关闭 SIP 的路线完成 `task_for_pid`。
 - 把一次性 sudo 凭据存到用户 macOS Keychain，后续缺 key 时可无人值守刷新。
 - 派生 WeChat V4 图片解码用的 `image_key` / `image_xor_key`，优先走本机 `kvcomm` cache，不读进程。
 
 ## 安装
 
-普通用户推荐直接安装 `wx-mcp`：
+普通用户推荐直接安装 `wechat-cli`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/r266-tech/wechat-local-mcp/main/scripts/install-release.sh | zsh
+curl -fsSL https://raw.githubusercontent.com/r266-tech/wechat-cli/main/scripts/install-release.sh | zsh
 ```
 
 开发者单独安装：
@@ -45,8 +45,8 @@ wxkey image-key
 | `doctor --scan` | 重新验证 live `task_for_pid` / heap scan 覆盖率 |
 | `setup` | 扫描并刷新 WCDB per-DB key map |
 | `image-key` | 派生并验证微信 V4 图片 `.dat` 解码 key |
-| `scan --quiet` | 底层扫描输出，主要给 `wx-mcp` 和维护者使用 |
-| `resign-wechat` | 显式准备 wx-mcp shadow WeChat，通常由 `bootstrap` 自动处理 |
+| `scan --quiet` | 底层扫描输出，主要给 `wechat-cli` 和维护者使用 |
+| `resign-wechat` | 显式准备 wechat-cli shadow WeChat，通常由 `bootstrap` 自动处理 |
 
 ## 首次初始化
 
@@ -57,7 +57,7 @@ wxkey bootstrap
 `bootstrap` 会：
 
 1. 检查微信是否登录、本地 DB 是否存在、已有 key 覆盖率。
-2. 必要时创建并 ad-hoc 签名 wx-mcp shadow WeChat。
+2. 必要时创建并 ad-hoc 签名 wechat-cli shadow WeChat。
 3. 让用户在本机隐藏提示里输入一次 Mac admin 密码。
 4. 把 sudo 凭据存入用户 Keychain。
 5. 扫描 WeChat 进程内存并验证 key。
@@ -89,4 +89,4 @@ See [LICENSE](LICENSE).
 <!-- babata-star-callout-v2 -->
 ## If wxkey helped you set things up
 
-`wxkey` is a bootstrap companion. The day-to-day product is [wechat-local-mcp](https://github.com/r266-tech/wechat-local-mcp) — that is the repo to star if you want to support continued maintenance. Part of [babata](https://github.com/r266-tech).
+`wxkey` is a bootstrap companion. The day-to-day product is [wechat-cli](https://github.com/r266-tech/wechat-cli) — that is the repo to star if you want to support continued maintenance. Part of [babata](https://github.com/r266-tech).

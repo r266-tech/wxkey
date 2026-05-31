@@ -39,7 +39,7 @@ Usage:
 
 Subcommands:
   bootstrap   One-command first-run setup for humans/agents: checks existing
-              config, prepares an ad-hoc signed wx-mcp shadow copy of WeChat
+              config, prepares an ad-hoc signed wechat-cli shadow copy of WeChat
               when needed, runs setup, and only prints a summary (not key
               material). Existing DB-key config still continues when image_key
               is missing, so local image decode can be repaired.
@@ -48,11 +48,11 @@ Subcommands:
   image-key   Derive the WeChat V4 local image_key from macOS kvcomm cache and
               a local *_t.dat validation sample; falls back to memory scan if
               disk derivation cannot verify a key. This does not read/write DB keys.
-  setup       Like scan, but also writes ~/.config/wxcli/config.json so wx-mcp
+  setup       Like scan, but also writes ~/.config/wxcli/config.json so wechat-cli
               can pick up the key on next start. Picks the most populated DB
               under root to publish (typically contact.db or message db).
               Also best-effort scans a WeChat V4 image_key when a *_t.dat
-              validation sample exists, so wx-mcp can decode local image .dat.
+              validation sample exists, so wechat-cli can decode local image .dat.
   doctor      Read-only health check: WeChat process, account dir, DB count,
               libWCDB.dylib presence, and cached key coverage from config.
               It does not scan memory by default; pass --scan for the slower
@@ -60,14 +60,14 @@ Subcommands:
   resign-wechat
               Operator diagnostic path: quit WeChat, ad-hoc re-sign
               /Applications/WeChat.app, then reopen it. Bootstrap uses a
-              wx-mcp shadow copy by default to avoid App Store app-management
+              wechat-cli shadow copy by default to avoid App Store app-management
               prompts.
   list-pids   Print one WeChat PID per line (or empty if not running).
 
 Notes:
   - WeChat must be running and have opened at least one DB this session.
   - SIP stays enabled. First-time key extraction uses one route only:
-    ad-hoc-signed WeChat + sudo privileges. Bootstrap signs a wx-mcp-managed
+    ad-hoc-signed WeChat + sudo privileges. Bootstrap signs a wechat-cli-managed
     shadow copy when the installed WeChat cannot be modified. wxkey asks for
     the admin password once and stores it in the user's macOS Keychain for
     later unattended refreshes.
@@ -191,7 +191,7 @@ type imageKeyCommandOutput struct {
 
 // wxcliConfig is the on-disk schema written to ~/.config/wxcli/config.json
 // after a successful `wxkey setup`. The "keys" map carries one per-DB
-// SQLCipher 4 enc_key (post-PBKDF2) per file salt. wx-mcp passes them to
+// SQLCipher 4 enc_key (post-PBKDF2) per file salt. wechat-cli passes them to
 // sqlite3_key_v2 as 96-hex `x'<key><salt>'` SQL literals (raw-key path),
 // avoiding the 256000-round PBKDF2 on every DB open.
 type wxcliConfig struct {
@@ -455,7 +455,7 @@ func runBootstrap(args []string) {
 		printedHeader = true
 		fmt.Printf("[OK] key config already exists: %s\n", cfgPath)
 		fmt.Printf("     wxid=%s db_root=%s keys=%d\n", cfg.WxID, cfg.DBRoot, len(cfg.Keys))
-		fmt.Println("     sudo credential is stored in macOS Keychain; wx-mcp can refresh keys without SIP.")
+		fmt.Println("     sudo credential is stored in macOS Keychain; wechat-cli can refresh keys without SIP.")
 		if configHasImageKey(cfg) {
 			return
 		}
@@ -494,7 +494,7 @@ func runBootstrap(args []string) {
 				fail("resign-wechat failed: %v", err)
 			}
 		} else {
-			fmt.Println("[INFO] WeChat has official Hardened Runtime; using wx-mcp shadow copy for no-SIP bootstrap.")
+			fmt.Println("[INFO] WeChat has official Hardened Runtime; using wechat-cli shadow copy for no-SIP bootstrap.")
 			pid, done, err := prepareShadowWeChat()
 			if err != nil {
 				fail("prepare shadow WeChat: %v", err)
@@ -534,7 +534,7 @@ func runBootstrap(args []string) {
 		fmt.Printf("       wxid: %s\n", existingCfg.WxID)
 		fmt.Printf("       db_root: %s\n", existingCfg.DBRoot)
 		fmt.Println("")
-		fmt.Println("Done. wx-mcp can now decode local WeChat V4 image .dat into readable image paths.")
+		fmt.Println("Done. wechat-cli can now decode local WeChat V4 image .dat into readable image paths.")
 		return
 	}
 
@@ -552,7 +552,7 @@ func runBootstrap(args []string) {
 	fmt.Printf("       db_root: %s\n", res.Root)
 	fmt.Printf("       keys: %d\n", len(res.Results))
 	fmt.Println("")
-	fmt.Println("Done. Register/start wx-mcp now; future key refresh uses stored sudo while SIP stays enabled.")
+	fmt.Println("Done. Start wechat-cli now; future key refresh uses stored sudo while SIP stays enabled.")
 }
 
 // --- helpers ---
@@ -619,7 +619,7 @@ func prepareShadowWeChat() (int, func(), error) {
 		hadWeChatRunning = true
 	}
 
-	fmt.Println("[INFO] Preparing wx-mcp WeChat shadow copy...")
+	fmt.Println("[INFO] Preparing wechat-cli WeChat shadow copy...")
 	if err := exec.Command("/usr/bin/killall", "WeChat").Run(); err != nil {
 		// killall exits non-zero when WeChat is not running. That is fine here.
 	}
@@ -645,7 +645,7 @@ func prepareShadowWeChat() (int, func(), error) {
 		return 0, nil, fmt.Errorf("shadow WeChat is not ad-hoc signed after codesign:\n%s", sig.Raw)
 	}
 
-	fmt.Println("[INFO] Opening wx-mcp WeChat shadow copy...")
+	fmt.Println("[INFO] Opening wechat-cli WeChat shadow copy...")
 	if err := exec.Command("/usr/bin/open", "-n", shadowPath).Run(); err != nil {
 		return 0, nil, fmt.Errorf("open shadow WeChat: %w", err)
 	}
@@ -1164,7 +1164,7 @@ func storeSudoPassword(password string) error {
 	script := fmt.Sprintf("add-generic-password -a %s -s %s -l %s -j %s -U -X %s\n",
 		securityArgQuote(sudoKeychainAccount()),
 		securityArgQuote(sudoKeychainService),
-		securityArgQuote("wx-mcp sudo password"),
+		securityArgQuote("wechat-cli sudo password"),
 		securityArgQuote("Stored by wxkey for unattended no-SIP WeChat DB key refresh"),
 		hex.EncodeToString([]byte(password)),
 	)
@@ -1186,7 +1186,7 @@ func securityArgQuote(s string) string {
 }
 
 func promptSudoPasswordGUI() (string, error) {
-	script := `display dialog "wx-mcp needs your Mac admin password once. It will be stored in your macOS Keychain so future WeChat key refreshes can run unattended without disabling SIP." default answer "" with hidden answer buttons {"Cancel", "Store"} default button "Store" cancel button "Cancel" with title "wx-mcp setup"`
+	script := `display dialog "wechat-cli needs your Mac admin password once. It will be stored in your macOS Keychain so future WeChat key refreshes can run unattended without disabling SIP." default answer "" with hidden answer buttons {"Cancel", "Store"} default button "Store" cancel button "Cancel" with title "wechat-cli setup"`
 	cmd := exec.Command("/usr/bin/osascript", "-e", script, "-e", "text returned of result")
 	out, err := cmd.Output()
 	if err != nil {
@@ -1239,7 +1239,7 @@ func buildElevateFailHint(reErr, origErr error) string {
 		fmt.Fprintln(&b, "       Keychain. Later setup runs can be unattended.")
 	} else {
 		fmt.Fprintln(&b, "       Re-run `wxkey bootstrap` once and enter the Mac admin password in the")
-		fmt.Fprintln(&b, "       wx-mcp hidden prompt. wxkey will verify it and store it in Keychain.")
+		fmt.Fprintln(&b, "       wechat-cli hidden prompt. wxkey will verify it and store it in Keychain.")
 	}
 	return b.String()
 }
@@ -1328,7 +1328,7 @@ func printPermissionAdvice(quiet bool, original error) {
 		fmt.Fprintf(os.Stderr, "       原始错误: %v\n", original)
 	}
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "       wx-mcp 的运行时解密不需要关闭 SIP; 取 key 只需要 no-SIP 重签 + 已存储的 sudo 凭据.")
+	fmt.Fprintln(os.Stderr, "       wechat-cli 的运行时解密不需要关闭 SIP; 取 key 只需要 no-SIP 重签 + 已存储的 sudo 凭据.")
 
 	if disabled, raw := sipDisabled(); raw != "" {
 		if disabled {
@@ -1620,8 +1620,8 @@ func runDoctor(args []string) {
 	if dylib := findBundledDylib(); dylib != "" {
 		logf("[OK]   libWCDB.dylib: %s\n", dylib)
 	} else {
-		logf("[WARN] libWCDB.dylib 未找到 — wx-mcp 启动时会失败\n")
-		logf("       放到 wx-mcp 旁边的 lib/ 目录或 ~/.config/wxcli/lib/\n")
+		logf("[WARN] libWCDB.dylib 未找到 — wechat-cli 启动时会失败\n")
+		logf("       放到 wechat-cli 旁边或 ~/.config/wxcli/lib/\n")
 	}
 
 	cfgPath := f.config
@@ -1686,7 +1686,7 @@ func runDoctor(args []string) {
 		logf("[OK]   Key 覆盖率: %d/%d (100%%) — 所有 DB 都拿到了 key\n",
 			len(results), len(saltIdx))
 		logf("\n=== 全部就绪 ===\n")
-		logf("Agent 跑 `wxkey setup` 写 config, 然后启动 wx-mcp\n")
+		logf("Agent 跑 `wxkey setup` 写 config, 然后启动 wechat-cli\n")
 		return
 	}
 
@@ -1696,7 +1696,7 @@ func runDoctor(args []string) {
 	printMissingDBs(logf, dbs, saltIdx, foundSalts)
 	logf("\n=== 部分覆盖 ===\n")
 	logf("Agent 下一步: 提示用户只在 WeChat 里打开缺的聊天/朋友圈/收藏，触发 WCDB 加载那些 DB key，然后由 agent 重跑 `wxkey setup`\n")
-	logf("也可以暂时接受部分覆盖: 已拿到 key 的 DB 可继续支持大部分 wx-mcp 功能\n")
+	logf("也可以暂时接受部分覆盖: 已拿到 key 的 DB 可继续支持大部分 wechat-cli 功能\n")
 }
 
 func cachedFoundSalts(keys map[string]string, saltIdx map[string][]int) map[string]bool {
@@ -1726,7 +1726,7 @@ func printMissingDBs(logf func(string, ...any), dbs []dbfiles.DB, saltIdx map[st
 	}
 }
 
-// findBundledDylib hunts libWCDB.dylib in the same locations wx-mcp does.
+// findBundledDylib hunts libWCDB.dylib in the same locations wechat-cli does.
 // Used by `wxkey doctor` for human reporting (not for actually loading the
 // dylib — wxkey itself doesn't link against WCDB).
 func findBundledDylib() string {
@@ -1755,7 +1755,7 @@ func findBundledDylib() string {
 
 // chownToDirOwner makes a freshly-written file owned by the same user as its
 // parent directory. wxkey runs `setup` as root via stored sudo, so the
-// config file lands as root:wheel and the unprivileged caller (wx-mcp / shell)
+// config file lands as root:wheel and the unprivileged caller (wechat-cli / shell)
 // then can't read it on the next start, looping forever into wxkey setup.
 // No-op when not running as root.
 func chownToDirOwner(path string) {
