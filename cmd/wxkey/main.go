@@ -353,6 +353,7 @@ func writeKeyConfig(cfgPath, wxid, root string, results []scan.Result, imageKey 
 
 const defaultSetupTimeout = 3 * time.Minute
 const pbkdfEarlyBootstrapScanTimeout = 30 * time.Second
+const defaultPBKDFProbeTimeout = 5 * time.Minute
 
 type wechatVersionInfo struct {
 	ShortVersion string
@@ -663,7 +664,7 @@ func runBootstrap(args []string) {
 		formatDuration(strategy.ScanTimeout), formatDuration(pbkdfProbeTimeout()))
 	res, err := runSetupCaptured(setupFlags, strategy.ScanTimeout)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[wxkey] setup failed during bootstrap.\n")
+		fmt.Fprintf(os.Stderr, "[wxkey] initial passive scan did not capture DB keys before its deadline.\n")
 		fmt.Fprintf(os.Stderr, "        Trying PBKDF breakpoint fallback for WeChat 4.1.x...\n")
 		if setupFlags.pid > 0 {
 			_ = syscall.Kill(setupFlags.pid, syscall.SIGTERM)
@@ -1171,9 +1172,9 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
 	}
 	if len(probe.Found) == 0 {
 		if runErr != nil {
-			return nil, fmt.Errorf("PBKDF fallback found no keys: %w\n%s", runErr, strings.TrimSpace(stderr))
+			return nil, fmt.Errorf("PBKDF fallback found no keys: %w\n%s\n%s", runErr, strings.TrimSpace(stderr), pbkdfNoKeyDiagnosis(probe, root))
 		}
-		return nil, fmt.Errorf("PBKDF fallback found no keys")
+		return nil, fmt.Errorf("PBKDF fallback found no keys\n%s", pbkdfNoKeyDiagnosis(probe, root))
 	}
 
 	results := pbkdfProbeResults(root, probe, dbs)
@@ -1203,7 +1204,24 @@ func pbkdfProbeTimeout() time.Duration {
 	if d, ok := durationEnv("WXKEY_PBKDF_PROBE_TIMEOUT"); ok {
 		return d
 	}
-	return 90 * time.Second
+	return defaultPBKDFProbeTimeout
+}
+
+func pbkdfNoKeyDiagnosis(probe pbkdfProbeFile, root string) string {
+	hits := probe.Counters["hits"]
+	stops := probe.Counters["stops"]
+	kdfHits := probe.Counters["kdf_256k_salt_hits"]
+	macHits := probe.Counters["mac_kdf_salt_hits"]
+	summary := fmt.Sprintf("PBKDF diagnostics: dbs=%d unique_salts=%d breakpoint_stops=%d pbkdf_calls=%d matching_db_salt_calls=%d matching_mac_salt_calls=%d root=%s",
+		probe.DBCount, probe.UniqueSalts, stops, hits, kdfHits, macHits, root)
+	switch {
+	case hits == 0:
+		return summary + "\nNo PBKDF calls were observed. Keep the LLDB-launched WeChat window logged in, open one normal chat so WeChat decrypts DBs, then rerun `wxkey bootstrap`. On slow machines use `WXKEY_PBKDF_PROBE_TIMEOUT=5m wxkey bootstrap`."
+	case kdfHits == 0 && macHits == 0:
+		return summary + "\nPBKDF ran, but none of its salts matched this DB root. This usually means wxkey selected the wrong WeChat account directory; pass the correct `--root .../xwechat_files/<wxid>` or set WECHAT_CLI_DB_ROOT."
+	default:
+		return summary + "\nPBKDF ran and matched local DB salts, but no derived key verified page-1 HMAC. This WeChat build may have changed key derivation; update wechat-cli/wxkey and send this diagnostic line to the maintainer."
+	}
 }
 
 func firstDurationEnv(names ...string) (time.Duration, string, bool) {
@@ -1715,7 +1733,7 @@ func offsetProgressFn(quiet bool, elapsedOffset time.Duration) scan.ProgressFn {
 		}
 		last = time.Now()
 		s.Elapsed += elapsedOffset
-		fmt.Fprintf(os.Stderr, "[wxkey] scanned %.0f MB / %d regions, %d wrapped + %d salt + %d binary + %d bare hits, %d verified, found=%d\n",
+		fmt.Fprintf(os.Stderr, "[wxkey] scanned %.0f MB / %d regions, %d wrapped + %d salt + %d binary + %d bare hits, %d candidate_checks, found=%d\n",
 			float64(s.BytesScanned)/1024/1024, s.Regions, s.HexMatches, s.SaltMatches, s.BinaryPatternMatches,
 			s.BareHexMatches, s.Verifications, s.Found)
 	}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/r266-tech/wxkey/internal/scan"
@@ -122,6 +123,60 @@ func TestMergeScanResultsKeepsWrappedPassResults(t *testing.T) {
 	got := mergeScanResults(base, overlay)
 	if got["salt_a"].KeyHex != "key_a" || got["salt_b"].KeyHex != "new_key_b" || got["salt_c"].KeyHex != "key_c" {
 		t.Fatalf("merged scan results = %#v", got)
+	}
+}
+
+func TestPBKDFNoKeyDiagnosisExplainsFailureMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		probe   pbkdfProbeFile
+		want    string
+		wantAll []string
+	}{
+		{
+			name: "no breakpoint hits",
+			probe: pbkdfProbeFile{
+				DBCount:     26,
+				UniqueSalts: 26,
+				Counters:    map[string]int{"stops": 0, "hits": 0},
+			},
+			want: "No PBKDF calls were observed",
+		},
+		{
+			name: "salt mismatch",
+			probe: pbkdfProbeFile{
+				DBCount:     26,
+				UniqueSalts: 26,
+				Counters:    map[string]int{"stops": 12, "hits": 12},
+			},
+			want: "wrong WeChat account directory",
+		},
+		{
+			name: "matched salt but did not verify",
+			probe: pbkdfProbeFile{
+				DBCount:     26,
+				UniqueSalts: 26,
+				Counters:    map[string]int{"stops": 12, "hits": 12, "kdf_256k_salt_hits": 2},
+			},
+			want: "no derived key verified",
+			wantAll: []string{
+				"matching_db_salt_calls=2",
+				"root=/tmp/root",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pbkdfNoKeyDiagnosis(tt.probe, "/tmp/root")
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("diagnosis = %q, want substring %q", got, tt.want)
+			}
+			for _, want := range tt.wantAll {
+				if !strings.Contains(got, want) {
+					t.Fatalf("diagnosis = %q, want substring %q", got, want)
+				}
+			}
+		})
 	}
 }
 
