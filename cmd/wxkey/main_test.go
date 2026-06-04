@@ -65,6 +65,26 @@ func TestPathInsideApp(t *testing.T) {
 	}
 }
 
+func TestPBKDFProbeTargetSupportsExplicitApp(t *testing.T) {
+	app := filepath.Join(t.TempDir(), "WeChat-test.app")
+	exe := filepath.Join(app, "Contents", "MacOS", "WeChat")
+	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WXKEY_PBKDF_WECHAT_APP", app)
+
+	target, err := pbkdfProbeTargetForBootstrap()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.AppPath != app || target.ExePath != exe || target.Mode != "custom" {
+		t.Fatalf("target = %#v, want custom app/exe", target)
+	}
+}
+
 func TestConfigHasImageKey(t *testing.T) {
 	if configHasImageKey(wxcliConfig{ImageKey: "   "}) {
 		t.Fatalf("blank image key should not be ready")

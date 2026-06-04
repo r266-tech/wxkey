@@ -1098,6 +1098,12 @@ type pbkdfProbeFound struct {
 	PRF     int    `json:"prf"`
 }
 
+type pbkdfProbeTarget struct {
+	AppPath string
+	ExePath string
+	Mode    string
+}
+
 func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
 	root := f.root
 	if root == "" {
@@ -1113,14 +1119,14 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
 	}
 	wxid := filepath.Base(root)
 
-	shadowPath := shadowWeChatPath()
-	if _, err := os.Stat(filepath.Join(shadowPath, "Contents", "MacOS", "WeChat")); err != nil {
-		shadowPath, _, err = prepareShadowWeChatCopy()
-		if err != nil {
-			return nil, err
-		}
+	target, err := pbkdfProbeTargetForBootstrap()
+	if err != nil {
+		return nil, err
 	}
-	killWeChatProcessesUnderApp(shadowPath, syscall.SIGKILL)
+	hadWeChatRunning := stopWeChatForPBKDF(target.AppPath)
+	if hadWeChatRunning {
+		defer reopenOriginalWeChatAfterPBKDF()
+	}
 	time.Sleep(1 * time.Second)
 
 	tmpDir, err := os.MkdirTemp("", "wxkey-pbkdf-")
@@ -1147,7 +1153,7 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
 	args := []string{
 		"PYTHONPATH=" + lldbPyPath,
 		"/usr/bin/python3", scriptPath,
-		"--exe", filepath.Join(shadowPath, "Contents", "MacOS", "WeChat"),
+		"--exe", target.ExePath,
 		"--root", root,
 		"--out", outPath,
 		"--timeout", strconv.Itoa(int(timeout.Seconds())),
@@ -1155,13 +1161,13 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
 	if envTrue("WXKEY_PBKDF_EARLY_STOP") {
 		args = append(args, "--early-stop")
 	}
-	logf(f.quiet, "[wxkey] PBKDF fallback: launching shadow WeChat under LLDB (timeout %s)\n", timeout.Round(time.Second))
+	logf(f.quiet, "[wxkey] PBKDF fallback: launching %s WeChat under LLDB (timeout %s)\n", target.Mode, timeout.Round(time.Second))
 	commandTimeout := time.Duration(0)
 	if timeout > 0 {
 		commandTimeout = timeout + 15*time.Second
 	}
 	_, stderr, runErr := runChildCaptured(commandTimeout, "/usr/bin/env", args...)
-	killWeChatProcessesUnderApp(shadowPath, syscall.SIGKILL)
+	killWeChatProcessesUnderApp(target.AppPath, syscall.SIGKILL)
 
 	probe, parseErr := readPBKDFProbeFile(outPath)
 	if parseErr != nil {
@@ -1198,6 +1204,63 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
 		},
 		ConfigPath: cfgPath,
 	}, nil
+}
+
+func pbkdfProbeTargetForBootstrap() (pbkdfProbeTarget, error) {
+	if appPath := strings.TrimSpace(os.Getenv("WXKEY_PBKDF_WECHAT_APP")); appPath != "" {
+		exePath := filepath.Join(appPath, "Contents", "MacOS", "WeChat")
+		if _, err := os.Stat(exePath); err != nil {
+			return pbkdfProbeTarget{}, fmt.Errorf("PBKDF target executable not found under WXKEY_PBKDF_WECHAT_APP: %w", err)
+		}
+		return pbkdfProbeTarget{AppPath: appPath, ExePath: exePath, Mode: "custom"}, nil
+	}
+
+	originalExe := filepath.Join(wechatAppPath, "Contents", "MacOS", "WeChat")
+	sig := inspectWeChatSignature()
+	if sig.Err == nil && sig.AdHoc {
+		if _, err := os.Stat(originalExe); err != nil {
+			return pbkdfProbeTarget{}, fmt.Errorf("original WeChat executable not found: %w", err)
+		}
+		return pbkdfProbeTarget{AppPath: wechatAppPath, ExePath: originalExe, Mode: "original ad-hoc"}, nil
+	}
+
+	shadowPath := shadowWeChatPath()
+	shadowExe := filepath.Join(shadowPath, "Contents", "MacOS", "WeChat")
+	if _, err := os.Stat(shadowExe); err != nil {
+		var prepErr error
+		shadowPath, _, prepErr = prepareShadowWeChatCopy()
+		if prepErr != nil {
+			return pbkdfProbeTarget{}, prepErr
+		}
+		shadowExe = filepath.Join(shadowPath, "Contents", "MacOS", "WeChat")
+	}
+	return pbkdfProbeTarget{AppPath: shadowPath, ExePath: shadowExe, Mode: "shadow"}, nil
+}
+
+func stopWeChatForPBKDF(targetAppPath string) bool {
+	pids, _ := wechatPIDs()
+	if len(pids) == 0 {
+		return false
+	}
+	fmt.Println("[INFO] Stopping existing WeChat before PBKDF fallback so LLDB owns the decrypting instance...")
+	for _, pid := range pids {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+	time.Sleep(2 * time.Second)
+	killWeChatProcessesUnderApp(targetAppPath, syscall.SIGKILL)
+	for _, pid := range pids {
+		if pidAlive(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	return true
+}
+
+func reopenOriginalWeChatAfterPBKDF() {
+	if envTrue("WXKEY_NO_REOPEN_ORIGINAL_WECHAT") {
+		return
+	}
+	_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
 }
 
 func pbkdfProbeTimeout() time.Duration {
