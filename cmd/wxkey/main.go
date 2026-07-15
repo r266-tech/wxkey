@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -164,6 +165,13 @@ func parseFlags(args []string) scanFlags {
 			dieUsage("unknown flag: %s", a)
 		}
 	}
+	if f.config != "" && configWriteIsElevated() {
+		validated, err := validateConfigPathForWrite(f.config, true)
+		if err != nil {
+			dieUsage("unsafe elevated --config: %v", err)
+		}
+		f.config = validated
+	}
 	return f
 }
 
@@ -306,49 +314,41 @@ func runScan(args []string, doSetup bool) {
 }
 
 func writeKeyConfig(cfgPath, wxid, root string, results []scan.Result, imageKey *imageKeyOutput) error {
-	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
-		return fmt.Errorf("mkdir config dir: %w", err)
-	}
-	chownToInvokingUser(filepath.Dir(cfgPath))
-
-	keysMap := make(map[string]string, len(results))
-	for _, r := range results {
-		if r.SaltHex == "" || r.KeyHex == "" {
-			continue
+	return withConfigWriteLock(cfgPath, func(cfgPath string) error {
+		keysMap := make(map[string]string, len(results))
+		for _, r := range results {
+			if r.SaltHex == "" || r.KeyHex == "" {
+				continue
+			}
+			keysMap[r.SaltHex] = r.KeyHex
 		}
-		keysMap[r.SaltHex] = r.KeyHex
-	}
-	existingCfg, hadExistingCfg := readWxcliConfig(cfgPath)
-	if hadExistingCfg && sameAccountConfig(existingCfg, wxid, root) {
-		for salt, key := range existingCfg.Keys {
-			if _, ok := keysMap[salt]; !ok {
-				keysMap[salt] = key
+		existingCfg, hadExistingCfg := readWxcliConfig(cfgPath)
+		if hadExistingCfg && sameAccountConfig(existingCfg, wxid, root) {
+			for salt, key := range existingCfg.Keys {
+				if _, ok := keysMap[salt]; !ok {
+					keysMap[salt] = key
+				}
 			}
 		}
-	}
 
-	cfg := wxcliConfig{
-		SchemaVersion: 2,
-		WxID:          wxid,
-		DBRoot:        root,
-		Keys:          keysMap,
-		KeyEpoch:      time.Now().Unix(),
-	}
-	if imageKey != nil && imageKey.Key != "" {
-		cfg.ImageKey = imageKey.Key
-		cfg.ImageXORKey = imageKey.XORKey
-	} else if hadExistingCfg && sameAccountConfig(existingCfg, wxid, root) {
-		cfg.ImageKey = existingCfg.ImageKey
-		cfg.ImageXORKey = existingCfg.ImageXORKey
-	}
-	data, _ := json.MarshalIndent(cfg, "", "  ")
-	data = append(data, '\n')
-	if err := os.WriteFile(cfgPath, data, 0o600); err != nil {
-		return err
-	}
-	chownToInvokingUser(cfgPath)
-	chownToDirOwner(cfgPath)
-	return nil
+		cfg := wxcliConfig{
+			SchemaVersion: 2,
+			WxID:          wxid,
+			DBRoot:        root,
+			Keys:          keysMap,
+			KeyEpoch:      time.Now().Unix(),
+		}
+		if imageKey != nil && imageKey.Key != "" {
+			cfg.ImageKey = imageKey.Key
+			cfg.ImageXORKey = imageKey.XORKey
+		} else if hadExistingCfg && sameAccountConfig(existingCfg, wxid, root) {
+			cfg.ImageKey = existingCfg.ImageKey
+			cfg.ImageXORKey = existingCfg.ImageXORKey
+		}
+		data, _ := json.MarshalIndent(cfg, "", "  ")
+		data = append(data, '\n')
+		return writeConfigBytes(cfgPath, data)
+	})
 }
 
 const defaultSetupTimeout = 3 * time.Minute
@@ -700,6 +700,256 @@ func defaultConfigPath() string {
 	return filepath.Join(effectiveUserHome(), ".config", "wxcli", "config.json")
 }
 
+func configWriteIsElevated() bool {
+	return os.Geteuid() == 0 || envTrue("WXKEY_ELEVATED")
+}
+
+func validateConfigPathForWrite(path string, elevated bool) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("config path is empty")
+	}
+	clean, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	if elevated {
+		defaultPath, err := filepath.Abs(filepath.Clean(defaultConfigPath()))
+		if err != nil {
+			return "", err
+		}
+		if clean != defaultPath {
+			return "", fmt.Errorf("elevated wxkey may only write the invoking user's default config %s", defaultPath)
+		}
+		home, err := filepath.Abs(filepath.Clean(effectiveUserHome()))
+		if err != nil {
+			return "", err
+		}
+		rel, err := filepath.Rel(home, clean)
+		if err != nil || rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return "", fmt.Errorf("elevated config path escapes invoking user's home")
+		}
+		root, err := os.OpenRoot(home)
+		if err != nil {
+			return "", fmt.Errorf("open invoking user's home: %w", err)
+		}
+		defer root.Close()
+		if err := rejectRootSymlinkComponents(root, rel, true); err != nil {
+			return "", fmt.Errorf("unsafe elevated config path: %w", err)
+		}
+		return clean, nil
+	}
+	if info, err := os.Lstat(clean); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("config path must not be a symbolic link")
+		}
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("config path is not a regular file")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	return clean, nil
+}
+
+func rejectRootSymlinkComponents(root *os.Root, rel string, allowMissing bool) error {
+	current := ""
+	parts := strings.Split(filepath.Clean(rel), string(os.PathSeparator))
+	for i, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("invalid path component")
+		}
+		current = filepath.Join(current, part)
+		info, err := root.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) && allowMissing {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("path component %s is a symbolic link", current)
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return fmt.Errorf("path component %s is not a directory", current)
+		}
+		if i == len(parts)-1 && !info.Mode().IsRegular() {
+			return fmt.Errorf("config path is not a regular file")
+		}
+	}
+	return nil
+}
+
+func openConfigWriteRoot(path string, elevated bool) (string, *os.Root, string, error) {
+	clean, err := validateConfigPathForWrite(path, elevated)
+	if err != nil {
+		return "", nil, "", err
+	}
+	rootPath := filepath.Dir(clean)
+	rel := filepath.Base(clean)
+	if elevated {
+		rootPath, err = filepath.Abs(filepath.Clean(effectiveUserHome()))
+		if err != nil {
+			return "", nil, "", err
+		}
+		rel, err = filepath.Rel(rootPath, clean)
+		if err != nil {
+			return "", nil, "", err
+		}
+	} else {
+		if err := os.MkdirAll(rootPath, 0o700); err != nil {
+			return "", nil, "", fmt.Errorf("mkdir config dir: %w", err)
+		}
+		if info, err := os.Lstat(rootPath); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return "", nil, "", fmt.Errorf("config parent is not a trusted directory")
+		}
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return "", nil, "", err
+	}
+	parent := filepath.Dir(rel)
+	if err := root.MkdirAll(parent, 0o700); err != nil {
+		_ = root.Close()
+		return "", nil, "", fmt.Errorf("mkdir config dir: %w", err)
+	}
+	if err := rejectRootSymlinkComponents(root, rel, true); err != nil {
+		_ = root.Close()
+		return "", nil, "", fmt.Errorf("unsafe config path: %w", err)
+	}
+	return clean, root, rel, nil
+}
+
+func withConfigWriteLock(path string, fn func(string) error) error {
+	elevated := configWriteIsElevated()
+	clean, root, rel, err := openConfigWriteRoot(path, elevated)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if elevated {
+		if uid, gid, ok := invokingUserIDs(); ok {
+			if err := chownRootParents(root, filepath.Dir(rel), uid, gid); err != nil {
+				return err
+			}
+		}
+	}
+	lockRel := filepath.Join(filepath.Dir(rel), "."+filepath.Base(rel)+".lock")
+	if info, err := root.Lstat(lockRel); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("config lock path is not a regular file")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	lockFile, err := root.OpenFile(lockRel, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
+	lockInfo, err := lockFile.Stat()
+	if err != nil || !lockInfo.Mode().IsRegular() {
+		return fmt.Errorf("config lock is not a regular file")
+	}
+	pathInfo, err := root.Lstat(lockRel)
+	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(pathInfo, lockInfo) {
+		return fmt.Errorf("config lock path changed during validation")
+	}
+	if elevated {
+		if uid, gid, ok := invokingUserIDs(); ok {
+			if err := lockFile.Chown(uid, gid); err != nil {
+				return err
+			}
+		}
+	}
+	if err := lockFile.Chmod(0o600); err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) }()
+	return fn(clean)
+}
+
+func writeConfigBytes(path string, data []byte) error {
+	elevated := configWriteIsElevated()
+	_, root, rel, err := openConfigWriteRoot(path, elevated)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	parent := filepath.Dir(rel)
+	var random [8]byte
+	if _, err := cryptorand.Read(random[:]); err != nil {
+		return fmt.Errorf("generate config temporary name: %w", err)
+	}
+	tmpRel := filepath.Join(parent, "."+filepath.Base(rel)+".tmp-"+hex.EncodeToString(random[:]))
+	file, err := root.OpenFile(tmpRel, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	keepTemp := true
+	defer func() {
+		_ = file.Close()
+		if keepTemp {
+			_ = root.Remove(tmpRel)
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return err
+	}
+	if elevated {
+		if uid, gid, ok := invokingUserIDs(); ok {
+			if err := file.Chown(uid, gid); err != nil {
+				return err
+			}
+			if err := chownRootParents(root, parent, uid, gid); err != nil {
+				return err
+			}
+		}
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := root.Rename(tmpRel, rel); err != nil {
+		return err
+	}
+	keepTemp = false
+	return nil
+}
+
+func invokingUserIDs() (int, int, bool) {
+	info, err := os.Stat(effectiveUserHome())
+	if err != nil {
+		return 0, 0, false
+	}
+	sys, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return int(sys.Uid), int(sys.Gid), true
+}
+
+func chownRootParents(root *os.Root, rel string, uid, gid int) error {
+	if rel == "." || rel == "" {
+		return nil
+	}
+	current := ""
+	for _, part := range strings.Split(filepath.Clean(rel), string(os.PathSeparator)) {
+		current = filepath.Join(current, part)
+		if err := root.Chown(current, uid, gid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func configReady(path string) (wxcliConfig, bool) {
 	var cfg wxcliConfig
 	data, err := os.ReadFile(path)
@@ -751,6 +1001,165 @@ func shadowWeChatPath() string {
 	return filepath.Join(effectiveUserHome(), "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
 }
 
+func validateShadowWeChatPath(path string) (string, string, string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", "", "", fmt.Errorf("shadow WeChat path is empty")
+	}
+	home, err := filepath.Abs(filepath.Clean(effectiveUserHome()))
+	if err != nil {
+		return "", "", "", err
+	}
+	rootPath := filepath.Join(home, "Library", "Application Support", "wx-mcp")
+	clean, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", "", "", err
+	}
+	name := filepath.Base(clean)
+	if filepath.Dir(clean) != rootPath || name == "." || name == string(os.PathSeparator) || !strings.HasSuffix(strings.ToLower(name), ".app") {
+		return "", "", "", fmt.Errorf("shadow WeChat path must be an .app directly under %s", rootPath)
+	}
+	return clean, rootPath, name, nil
+}
+
+func safeRemoveShadowWeChat(path string) error {
+	_, rootPath, name, err := validateShadowWeChatPath(path)
+	if err != nil {
+		return err
+	}
+	shadowRoot, err := openManagedShadowRoot(rootPath)
+	if err != nil {
+		return err
+	}
+	defer shadowRoot.Close()
+	if info, err := shadowRoot.Lstat(name); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("shadow WeChat path must not be a symbolic link")
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("shadow WeChat path is not an app directory")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return shadowRoot.RemoveAll(name)
+}
+
+func openManagedShadowRoot(rootPath string) (*os.Root, error) {
+	home, err := filepath.Abs(filepath.Clean(effectiveUserHome()))
+	if err != nil {
+		return nil, err
+	}
+	homeRoot, err := os.OpenRoot(home)
+	if err != nil {
+		return nil, err
+	}
+	defer homeRoot.Close()
+	relRoot, err := filepath.Rel(home, rootPath)
+	if err != nil || relRoot == "." || filepath.IsAbs(relRoot) || relRoot == ".." || strings.HasPrefix(relRoot, ".."+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("shadow root escapes invoking user's home")
+	}
+	if err := homeRoot.MkdirAll(relRoot, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir shadow parent: %w", err)
+	}
+	if err := rejectRootDirectorySymlinks(homeRoot, relRoot); err != nil {
+		return nil, fmt.Errorf("unsafe shadow parent: %w", err)
+	}
+	shadowRoot, err := homeRoot.OpenRoot(relRoot)
+	if err != nil {
+		return nil, err
+	}
+	openedDir, err := shadowRoot.Open(".")
+	if err != nil {
+		_ = shadowRoot.Close()
+		return nil, err
+	}
+	openedInfo, statErr := openedDir.Stat()
+	_ = openedDir.Close()
+	if statErr != nil {
+		_ = shadowRoot.Close()
+		return nil, statErr
+	}
+	if err := rejectRootDirectorySymlinks(homeRoot, relRoot); err != nil {
+		_ = shadowRoot.Close()
+		return nil, fmt.Errorf("shadow parent changed during validation: %w", err)
+	}
+	pathInfo, err := homeRoot.Lstat(relRoot)
+	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(pathInfo, openedInfo) {
+		_ = shadowRoot.Close()
+		return nil, fmt.Errorf("shadow parent changed during validation")
+	}
+	return shadowRoot, nil
+}
+
+func stageAndPublishShadowWeChat(path string, build func(string) error) error {
+	_, rootPath, finalName, err := validateShadowWeChatPath(path)
+	if err != nil {
+		return err
+	}
+	root, err := openManagedShadowRoot(rootPath)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	var nonce [12]byte
+	if _, err := cryptorand.Read(nonce[:]); err != nil {
+		return err
+	}
+	stageName := ".wxkey-shadow-stage-" + hex.EncodeToString(nonce[:])
+	if err := root.Mkdir(stageName, 0o700); err != nil {
+		return err
+	}
+	if os.Geteuid() == 0 {
+		uid, gid, ok := invokingUserIDs()
+		if !ok || uid == 0 {
+			_ = root.RemoveAll(stageName)
+			return fmt.Errorf("refusing elevated shadow staging without a verified invoking user")
+		}
+		if err := root.Chown(stageName, uid, gid); err != nil {
+			_ = root.RemoveAll(stageName)
+			return err
+		}
+	}
+	defer func() { _ = root.RemoveAll(stageName) }()
+	stagedRel := filepath.Join(stageName, finalName)
+	stagedPath := filepath.Join(rootPath, stagedRel)
+	if err := build(stagedPath); err != nil {
+		return err
+	}
+	info, err := root.Lstat(stagedRel)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("staged shadow WeChat is not a real app directory")
+	}
+	if err := root.RemoveAll(finalName); err != nil {
+		return err
+	}
+	return root.Rename(stagedRel, finalName)
+}
+
+func rejectRootDirectorySymlinks(root *os.Root, rel string) error {
+	current := ""
+	for _, part := range strings.Split(filepath.Clean(rel), string(os.PathSeparator)) {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("invalid directory component")
+		}
+		current = filepath.Join(current, part)
+		info, err := root.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("directory component %s is a symbolic link", current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("directory component %s is not a directory", current)
+		}
+	}
+	return nil
+}
+
 func prepareShadowWeChat() (int, func(), error) {
 	shadowPath, hadWeChatRunning, err := prepareShadowWeChatCopy()
 	if err != nil {
@@ -780,7 +1189,10 @@ func prepareShadowWeChat() (int, func(), error) {
 }
 
 func prepareShadowWeChatCopy() (string, bool, error) {
-	shadowPath := shadowWeChatPath()
+	shadowPath, _, _, err := validateShadowWeChatPath(shadowWeChatPath())
+	if err != nil {
+		return "", false, err
+	}
 	hadWeChatRunning := false
 	if pids, _ := wechatPIDs(); len(pids) > 0 {
 		hadWeChatRunning = true
@@ -792,24 +1204,26 @@ func prepareShadowWeChatCopy() (string, bool, error) {
 	}
 	time.Sleep(2 * time.Second)
 
-	if err := os.RemoveAll(shadowPath); err != nil {
+	if err := safeRemoveShadowWeChat(shadowPath); err != nil {
 		return "", hadWeChatRunning, fmt.Errorf("remove stale shadow copy %s: %w", shadowPath, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(shadowPath), 0o755); err != nil {
-		return "", hadWeChatRunning, fmt.Errorf("mkdir shadow parent: %w", err)
-	}
-	if out, err := exec.Command("/bin/cp", "-R", wechatAppPath, shadowPath).CombinedOutput(); err != nil {
-		return "", hadWeChatRunning, fmt.Errorf("copy WeChat to shadow path: %w\n%s", err, strings.TrimSpace(string(out)))
-	}
-	if out, err := exec.Command("/usr/bin/codesign", "--force", "--deep", "--sign", "-", shadowPath).CombinedOutput(); err != nil {
-		return "", hadWeChatRunning, fmt.Errorf("codesign shadow WeChat failed: %w\n%s", err, strings.TrimSpace(string(out)))
-	}
-	sig := inspectAppSignature(shadowPath)
-	if sig.Err != nil {
-		return "", hadWeChatRunning, fmt.Errorf("inspect shadow WeChat signature: %w\n%s", sig.Err, sig.Raw)
-	}
-	if !sig.AdHoc {
-		return "", hadWeChatRunning, fmt.Errorf("shadow WeChat is not ad-hoc signed after codesign:\n%s", sig.Raw)
+	if err := stageAndPublishShadowWeChat(shadowPath, func(stagedPath string) error {
+		if out, err := combinedOutputAsInvokingUser("/bin/cp", "-R", wechatAppPath, stagedPath); err != nil {
+			return fmt.Errorf("copy WeChat to staged shadow path: %w\n%s", err, strings.TrimSpace(string(out)))
+		}
+		if out, err := combinedOutputAsInvokingUser("/usr/bin/codesign", "--force", "--deep", "--sign", "-", stagedPath); err != nil {
+			return fmt.Errorf("codesign staged shadow WeChat failed: %w\n%s", err, strings.TrimSpace(string(out)))
+		}
+		sig := inspectAppSignature(stagedPath)
+		if sig.Err != nil {
+			return fmt.Errorf("inspect staged shadow WeChat signature: %w\n%s", sig.Err, sig.Raw)
+		}
+		if !sig.AdHoc {
+			return fmt.Errorf("staged shadow WeChat is not ad-hoc signed after codesign:\n%s", sig.Raw)
+		}
+		return nil
+	}); err != nil {
+		return "", hadWeChatRunning, err
 	}
 	return shadowPath, hadWeChatRunning, nil
 }
@@ -1627,27 +2041,24 @@ func killProcessGroup(pid int) {
 }
 
 func writeImageKeyToConfig(path, key string, xorKey *int) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	var cfg wxcliConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return err
-	}
-	cfg.ImageKey = strings.TrimSpace(key)
-	cfg.ImageXORKey = xorKey
-	out, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	out = append(out, '\n')
-	if err := os.WriteFile(path, out, 0o600); err != nil {
-		return err
-	}
-	chownToInvokingUser(path)
-	chownToDirOwner(path)
-	return nil
+	return withConfigWriteLock(path, func(path string) error {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		var cfg wxcliConfig
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return err
+		}
+		cfg.ImageKey = strings.TrimSpace(key)
+		cfg.ImageXORKey = xorKey
+		out, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			return err
+		}
+		out = append(out, '\n')
+		return writeConfigBytes(path, out)
+	})
 }
 
 func effectiveUserHome() string {
@@ -1940,7 +2351,7 @@ func promptSudoPasswordGUI() (string, error) {
 }
 
 func sudoValidatePassword(password string) error {
-	cmd := exec.Command("sudo", "-S", "-p", "", "-v")
+	cmd := exec.Command("/usr/bin/sudo", "-S", "-p", "", "-v")
 	cmd.Stdin = strings.NewReader(password + "\n")
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
@@ -1951,7 +2362,7 @@ func sudoValidatePassword(password string) error {
 }
 
 func sudoCommandWithPassword(password string, args ...string) *exec.Cmd {
-	cmd := exec.Command("sudo", append([]string{"-S", "-p", ""}, args...)...)
+	cmd := exec.Command("/usr/bin/sudo", append([]string{"-S", "-p", ""}, args...)...)
 	cmd.Stdin = strings.NewReader(password + "\n")
 	return cmd
 }
@@ -2050,10 +2461,63 @@ func inspectWeChatSignature() wechatSignatureStatus {
 }
 
 func inspectAppSignature(appPath string) wechatSignatureStatus {
-	out, err := exec.Command("/usr/bin/codesign", "-dv", appPath).CombinedOutput()
+	out, err := combinedOutputAsInvokingUser("/usr/bin/codesign", "-dv", appPath)
 	st := classifyWeChatSignature(string(out))
 	st.Err = err
 	return st
+}
+
+func combinedOutputAsInvokingUser(name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	if os.Geteuid() != 0 {
+		return cmd.CombinedOutput()
+	}
+	uid, gid, ok := invokingUserIDs()
+	if !ok || uid == 0 {
+		return nil, fmt.Errorf("refusing to run %s as root without a verified invoking user", name)
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)},
+	}
+	cmd.Env = invokingUserCommandEnv(os.Environ())
+	return cmd.CombinedOutput()
+}
+
+func invokingUserCommandEnv(env []string) []string {
+	home := effectiveUserHome()
+	user := strings.TrimSpace(os.Getenv("WXKEY_ORIG_USER"))
+	if user == "" {
+		if uid, _, ok := invokingUserIDs(); ok {
+			if owner, err := userpkg.LookupId(strconv.Itoa(uid)); err == nil {
+				user = owner.Username
+			}
+		}
+	}
+	values := map[string]string{"HOME": home}
+	if user != "" {
+		values["USER"] = user
+		values["LOGNAME"] = user
+	}
+	out := make([]string, 0, len(env)+len(values))
+	seen := map[string]bool{}
+	for _, item := range env {
+		key, _, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		if value, replace := values[key]; replace {
+			out = append(out, key+"="+value)
+			seen[key] = true
+			continue
+		}
+		out = append(out, item)
+	}
+	for key, value := range values {
+		if !seen[key] {
+			out = append(out, key+"="+value)
+		}
+	}
+	return out
 }
 
 func printPermissionAdvice(quiet bool, original error) {
@@ -2492,40 +2956,4 @@ func findBundledDylib() string {
 		}
 	}
 	return ""
-}
-
-// chownToDirOwner makes a freshly-written file owned by the same user as its
-// parent directory. wxkey runs `setup` as root via stored sudo, so the
-// config file lands as root:wheel and the unprivileged caller (wechat-cli / shell)
-// then can't read it on the next start, looping forever into wxkey setup.
-// No-op when not running as root.
-func chownToDirOwner(path string) {
-	if os.Geteuid() != 0 {
-		return
-	}
-	info, err := os.Stat(filepath.Dir(path))
-	if err != nil {
-		return
-	}
-	sys, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return
-	}
-	_ = os.Chown(path, int(sys.Uid), int(sys.Gid))
-}
-
-func chownToInvokingUser(path string) {
-	if os.Geteuid() != 0 {
-		return
-	}
-	home := effectiveUserHome()
-	info, err := os.Stat(home)
-	if err != nil {
-		return
-	}
-	sys, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return
-	}
-	_ = os.Chown(path, int(sys.Uid), int(sys.Gid))
 }
