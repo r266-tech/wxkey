@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/r266-tech/wxkey/internal/scan"
 )
@@ -50,6 +51,259 @@ func TestSudoKeychainAccountPrefersOriginalUser(t *testing.T) {
 	t.Setenv("SUDO_USER", "bob")
 	if got := sudoKeychainAccount(); got != "alice" {
 		t.Fatalf("sudoKeychainAccount = %q, want alice", got)
+	}
+}
+
+func TestSudoCommandsUseSystemBinary(t *testing.T) {
+	cmd := sudoCommandWithPassword("not-used", "-v")
+	if cmd.Path != "/usr/bin/sudo" {
+		t.Fatalf("sudo command path = %q, want /usr/bin/sudo", cmd.Path)
+	}
+}
+
+func TestElevatedConfigPathIsFixedAndRejectsSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("WXKEY_ORIG_HOME", home)
+	defaultPath := defaultConfigPath()
+	if got, err := validateConfigPathForWrite(defaultPath, true); err != nil || got != defaultPath {
+		t.Fatalf("default elevated config = %q/%v, want %q", got, err, defaultPath)
+	}
+	if _, err := validateConfigPathForWrite(filepath.Join(home, "other.json"), true); err == nil {
+		t.Fatalf("elevated custom config path should be rejected")
+	}
+	if err := os.MkdirAll(filepath.Dir(defaultPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "target.json")
+	if err := os.WriteFile(target, []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, defaultPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := validateConfigPathForWrite(defaultPath, true); err == nil {
+		t.Fatalf("elevated config symlink should be rejected")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "sentinel" {
+		t.Fatalf("symlink target changed: %q/%v", data, err)
+	}
+}
+
+func TestConfigWriteLockSerializesTransactions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- withConfigWriteLock(path, func(string) error {
+			close(firstEntered)
+			<-releaseFirst
+			return nil
+		})
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first config transaction did not acquire lock")
+	}
+
+	secondAttempted := make(chan struct{})
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondAttempted)
+		secondDone <- withConfigWriteLock(path, func(string) error {
+			close(secondEntered)
+			return nil
+		})
+	}()
+	<-secondAttempted
+	select {
+	case <-secondEntered:
+		close(releaseFirst)
+		<-firstDone
+		<-secondDone
+		t.Fatal("second config transaction entered before first released lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first config transaction: %v", err)
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second config transaction did not acquire released lock")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second config transaction: %v", err)
+	}
+}
+
+func TestConfigWriteLockRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	target := filepath.Join(dir, "lock-target")
+	if err := os.WriteFile(target, []byte("sentinel"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, ".config.json.lock")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := withConfigWriteLock(path, func(string) error { return nil }); err == nil {
+		t.Fatal("config write lock accepted a symbolic link")
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "sentinel" {
+		t.Fatalf("lock symlink target changed: %q/%v", data, err)
+	}
+}
+
+func TestSafeRemoveShadowWeChatStaysInManagedDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("WXKEY_ORIG_HOME", home)
+	managed := filepath.Join(home, "Library", "Application Support", "wx-mcp", "WeChat-test.app")
+	if _, _, _, err := validateShadowWeChatPath(managed); err != nil {
+		t.Fatalf("managed shadow path rejected: %v", err)
+	}
+	outside := filepath.Join(home, "keep.app")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(outside, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := safeRemoveShadowWeChat(outside); err == nil {
+		t.Fatalf("outside shadow path should be rejected")
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "keep" {
+		t.Fatalf("outside sentinel changed: %q/%v", data, err)
+	}
+	if err := os.MkdirAll(managed, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(managed, "stale"), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := safeRemoveShadowWeChat(managed); err != nil {
+		t.Fatalf("remove managed shadow: %v", err)
+	}
+	if _, err := os.Lstat(managed); !os.IsNotExist(err) {
+		t.Fatalf("managed shadow still exists: %v", err)
+	}
+}
+
+func TestSafeRemoveShadowWeChatRejectsSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("WXKEY_ORIG_HOME", home)
+	root := filepath.Join(home, "Library", "Application Support", "wx-mcp")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "outside.app")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(target, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "WeChat-link.app")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := safeRemoveShadowWeChat(link); err == nil {
+		t.Fatalf("shadow symlink should be rejected")
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "keep" {
+		t.Fatalf("shadow symlink target changed: %q/%v", data, err)
+	}
+}
+
+func TestSafeRemoveShadowWeChatRejectsManagedParentSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("WXKEY_ORIG_HOME", home)
+	appSupport := filepath.Join(home, "Library", "Application Support")
+	if err := os.MkdirAll(appSupport, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(home, "outside-root")
+	targetApp := filepath.Join(outside, "WeChat-shadow.app")
+	if err := os.MkdirAll(targetApp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(targetApp, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(appSupport, "wx-mcp")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	shadow := filepath.Join(appSupport, "wx-mcp", "WeChat-shadow.app")
+	if err := safeRemoveShadowWeChat(shadow); err == nil {
+		t.Fatal("managed shadow parent symlink should be rejected")
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "keep" {
+		t.Fatalf("parent symlink target changed: %q/%v", data, err)
+	}
+}
+
+func TestInvokingUserCommandEnvReplacesElevatedIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("WXKEY_ORIG_HOME", home)
+	t.Setenv("WXKEY_ORIG_USER", "alice")
+	env := invokingUserCommandEnv([]string{"HOME=/var/root", "USER=root", "LOGNAME=root", "KEEP=yes"})
+	values := map[string]string{}
+	for _, item := range env {
+		key, value, ok := strings.Cut(item, "=")
+		if ok {
+			values[key] = value
+		}
+	}
+	if values["HOME"] != home || values["USER"] != "alice" || values["LOGNAME"] != "alice" || values["KEEP"] != "yes" {
+		t.Fatalf("invoking user env = %#v", values)
+	}
+}
+
+func TestStageAndPublishShadowWeChatReplacesFinalSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("WXKEY_ORIG_HOME", home)
+	shadow := filepath.Join(home, "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
+	if err := safeRemoveShadowWeChat(shadow); err != nil {
+		t.Fatalf("prepare managed shadow directory: %v", err)
+	}
+	outside := filepath.Join(home, "outside.app")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(outside, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageAndPublishShadowWeChat(shadow, func(stagedPath string) error {
+		if err := os.MkdirAll(filepath.Join(stagedPath, "Contents", "MacOS"), 0o700); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(stagedPath, "Contents", "marker"), []byte("staged"), 0o600); err != nil {
+			return err
+		}
+		return os.Symlink(outside, shadow)
+	}); err != nil {
+		t.Fatalf("stage and publish shadow: %v", err)
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "keep" {
+		t.Fatalf("outside sentinel changed: %q/%v", data, err)
+	}
+	info, err := os.Lstat(shadow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		t.Fatalf("published shadow mode = %v, want real directory", info.Mode())
+	}
+	if data, err := os.ReadFile(filepath.Join(shadow, "Contents", "marker")); err != nil || string(data) != "staged" {
+		t.Fatalf("published marker = %q/%v", data, err)
 	}
 }
 
@@ -114,6 +368,9 @@ func TestWriteImageKeyToConfigPreservesDBKeys(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	xorKey := 240
 	if err := writeImageKeyToConfig(path, "  abcdefghijklmnop  ", &xorKey); err != nil {
 		t.Fatal(err)
@@ -128,6 +385,16 @@ func TestWriteImageKeyToConfigPreservesDBKeys(t *testing.T) {
 	}
 	if got.ImageKey != "abcdefghijklmnop" || got.ImageXORKey == nil || *got.ImageXORKey != 240 || got.Keys["salt"] != "enc" || got.KeyEpoch != 123 {
 		t.Fatalf("config after image_key write = %#v", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("config mode = %o, want 600", info.Mode().Perm())
+	}
+	if matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".config.json.tmp-*")); err != nil || len(matches) != 0 {
+		t.Fatalf("temporary config files = %#v/%v", matches, err)
 	}
 }
 
