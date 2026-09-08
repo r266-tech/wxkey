@@ -1845,6 +1845,18 @@ def read_mem(process, addr, size):
 def reg_u(frame, name):
     return frame.FindRegister(name).GetValueAsUnsigned()
 
+def pbkdf_args(process, frame):
+    arch = process.GetTarget().GetTriple().split("-", 1)[0]
+    if arch in ("arm64", "arm64e", "aarch64"):
+        return tuple(reg_u(frame, name) for name in ("x1", "x2", "x3", "x4", "x5", "x6"))
+    if arch == "x86_64":
+        # The seventh SysV argument is at the caller's stack pointer (CFA).
+        rounds = read_mem(process, frame.GetCFA(), 4)
+        if len(rounds) != 4:
+            raise RuntimeError("cannot read PBKDF rounds argument")
+        return tuple(reg_u(frame, name) for name in ("rsi", "rdx", "rcx", "r8", "r9")) + (int.from_bytes(rounds, "little"),)
+    raise RuntimeError("unsupported PBKDF target architecture: " + arch)
+
 def write_result(path, dbs, salt_to_db, found, seen, counters):
     result = {
         "found": found,
@@ -1878,12 +1890,7 @@ def should_stop_early(found, seen, salt_to_db, early_stop):
     return bool(found) and len(seen) >= target
 
 def handle_hit(process, frame, salt_to_db, macsalt_to_db, found, seen, counters):
-    password_ptr = reg_u(frame, "x1")
-    password_len = reg_u(frame, "x2")
-    salt_ptr = reg_u(frame, "x3")
-    salt_len = reg_u(frame, "x4")
-    prf = reg_u(frame, "x5")
-    rounds = reg_u(frame, "x6")
+    password_ptr, password_len, salt_ptr, salt_len, prf, rounds = pbkdf_args(process, frame)
     counters["hits"] += 1
     if salt_len != SALT_SIZE or password_len == 0 or password_len > 256:
         return False
