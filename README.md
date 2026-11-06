@@ -60,12 +60,17 @@ wxkey bootstrap
 
 `bootstrap` 会：
 
-1. 检查微信是否登录、本地 DB 是否存在、已有 key 覆盖率。
-2. 必要时创建并 ad-hoc 签名 wechat-cli shadow WeChat。
-3. 让用户在本机隐藏提示里输入一次 Mac admin 密码。
-4. 把 sudo 凭据存入用户 Keychain。
-5. 扫描 WeChat 进程内存并验证 key。
-6. 写入 `~/.config/wxcli/config.json`。
+1. 检查本地 DB 是否存在、已有 key 覆盖率；已有配置但缺 key 时也会继续补抓。
+2. 先用中文说明接下来会发生什么、用户要做什么（通常什么都不用做）。
+3. 必要时创建并 ad-hoc 签名 wechat-cli shadow WeChat（微信更新后自动重建）。
+4. 让用户在本机隐藏提示里输入一次 Mac admin 密码，并把 sudo 凭据存入用户 Keychain。
+5. 抓取 key：WeChat 4.1.10+ 官方签名版走 PBKDF 断点路线，其余版本扫描进程内存；都用 page-1 HMAC 验证。
+6. 写入 `~/.config/wxcli/config.json`（若 wechat-cli 已用钥匙串存 key，之后运行 `wechat-cli keychain migrate`）。
+
+WeChat 4.2+ / macOS 新版的“App 数据保护”会拒绝 ad-hoc 签名的 shadow 访问官方微信容器（`~/Library/Containers/com.tencent.xinWeChat`）。
+所以 shadow 运行在 `~/Library/Application Support/wx-mcp/WeChat-shadow-home`：这是官方容器里账号 DB、配置和登录状态的 APFS clone（跳过 msg/cache/log 等大目录，几乎不占空间），结束后删除。shadow 只写这份副本，不写真实容器。
+WeChat 4.x 每个账号所有 DB 的 key 都由同一个 32 字节密码派生（PBKDF2-HMAC-SHA512，256000 轮，盐为各 DB 的 salt），所以只要 shadow 打开任意一个 DB，wxkey 就能离线派生出全部 DB 的 key，包括微信本次没打开的库。
+如果 shadow 没能自动登录（停在“进入微信”或二维码），需要用户点“进入微信”并在手机上确认，否则 PBKDF 路线会在超时后报错。
 
 不需要关闭 SIP。不要把 admin 密码、config.json、DB key 或微信数据库发到 issue、聊天窗口或 agent 对话里。
 

@@ -16,9 +16,11 @@ import (
 	"os/exec"
 	userpkg "os/user"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -210,6 +212,9 @@ type wxcliConfig struct {
 	ImageKey      string            `json:"image_key,omitempty"`
 	ImageXORKey   *int              `json:"image_xor_key,omitempty"`
 	KeyEpoch      int64             `json:"key_epoch"`
+	// KeyStore is set by wechat-cli 2.x after `wechat-cli keychain migrate`
+	// (keys then live in macOS Keychain, not in this file). wxkey only reads it.
+	KeyStore string `json:"key_store,omitempty"`
 }
 
 func runScan(args []string, doSetup bool) {
@@ -549,33 +554,43 @@ func runBootstrap(args []string) {
 	if cfgPath == "" {
 		cfgPath = defaultConfigPath()
 	}
+	fmt.Println("=== wxkey bootstrap ===")
+
+	existingCfg, existingReady := configReady(cfgPath)
+	priorCfg, _ := readWxcliConfig(cfgPath)
+	missingKeys, totalSalts := 0, 0
+	if existingReady {
+		if f.root == "" {
+			f.root = existingCfg.DBRoot
+		}
+		if _, saltIdx, err := dbfiles.Collect(f.root); err == nil {
+			totalSalts = len(saltIdx)
+			missingKeys = totalSalts - len(cachedFoundSalts(existingCfg.Keys, saltIdx))
+		}
+	}
+	needKeys := !existingReady || missingKeys > 0
+	needImage := !existingReady || !configHasImageKey(existingCfg)
+
+	_, sudoErr := readStoredSudoPassword()
+	if needKeys || needImage {
+		printBootstrapUserNotice(sudoErr != nil)
+	}
 	if err := ensureStoredSudoPassword(); err != nil {
 		fail("prepare stored sudo credential: %v", err)
 	}
-	var existingCfg wxcliConfig
-	existingReady := false
-	printedHeader := false
-	if cfg, ok := configReady(cfgPath); ok {
-		existingCfg = cfg
-		existingReady = true
-		fmt.Println("=== wxkey bootstrap ===")
-		printedHeader = true
+	if existingReady {
 		fmt.Printf("[OK] key config already exists: %s\n", cfgPath)
-		fmt.Printf("     wxid=%s db_root=%s keys=%d\n", cfg.WxID, cfg.DBRoot, len(cfg.Keys))
+		fmt.Printf("     wxid=%s db_root=%s keys=%d\n", existingCfg.WxID, existingCfg.DBRoot, len(existingCfg.Keys))
 		fmt.Println("     sudo credential is stored in macOS Keychain; wechat-cli can refresh keys without SIP.")
-		if configHasImageKey(cfg) {
+		if !needKeys && !needImage {
 			return
 		}
-		fmt.Println("[INFO] image_key is missing; continuing bootstrap to refresh image decoding key.")
-	}
-
-	if !printedHeader {
-		fmt.Println("=== wxkey bootstrap ===")
-	}
-	if existingReady {
-		fmt.Println("[INFO] Goal: refresh image_key in existing config with SIP enabled.")
-		if f.root == "" {
-			f.root = existingCfg.DBRoot
+		if needKeys {
+			fmt.Printf("[INFO] %d/%d local DBs have no cached key; continuing bootstrap to capture them.\n", missingKeys, totalSalts)
+			fmt.Println("[INFO] Goal: add missing DB keys to existing config with SIP enabled.")
+		} else {
+			fmt.Println("[INFO] image_key is missing; continuing bootstrap to refresh image decoding key.")
+			fmt.Println("[INFO] Goal: refresh image_key in existing config with SIP enabled.")
 		}
 	} else {
 		fmt.Println("[INFO] Goal: prepare ~/.config/wxcli/config.json with SIP enabled.")
@@ -586,9 +601,25 @@ func runBootstrap(args []string) {
 		fail("WeChat app not found at %s: %v", wechatAppPath, err)
 	}
 
+	sig := inspectWeChatSignature()
+	officialRuntime := sig.Err == nil && sig.Runtime && !sig.AdHoc && !envTrue("WXKEY_BOOTSTRAP_ORIGINAL_WECHAT")
+	strategy := selectBootstrapKeyStrategy(wechatAppPath)
+	if needKeys && officialRuntime && strategy.PBKDFPreferred {
+		printBootstrapStrategy(strategy)
+		fmt.Println("[INFO] WeChat has official Hardened Runtime; capturing the account key from a shadow copy running on a cloned data home.")
+		res, err := runPBKDFProbeCaptured(f, cfgPath)
+		if err != nil {
+			fail("%v", err)
+		}
+		if needImage {
+			refreshImageKeyBestEffort(f, cfgPath)
+		}
+		printBootstrapKeySummary(res, priorCfg)
+		return
+	}
+
 	setupFlags := f
 	var cleanup func()
-	sig := inspectWeChatSignature()
 	if sig.Err != nil {
 		fmt.Fprintf(os.Stderr, "[WARN] WeChat signature check failed: %v\n", sig.Err)
 		if sig.Raw != "" {
@@ -602,7 +633,7 @@ func runBootstrap(args []string) {
 			}
 		} else {
 			fmt.Println("[INFO] WeChat has official Hardened Runtime; using wechat-cli shadow copy for no-SIP bootstrap.")
-			pid, done, err := prepareShadowWeChat()
+			pid, done, err := prepareShadowWeChat(setupFlags.root)
 			if err != nil {
 				fail("prepare shadow WeChat: %v", err)
 			}
@@ -615,18 +646,14 @@ func runBootstrap(args []string) {
 		fmt.Println("[INFO] WeChat signature state is not recognized; trying setup directly.")
 	}
 	if cleanup != nil {
-		defer func() {
-			if cleanup != nil {
-				cleanup()
-			}
-		}()
+		defer cleanup()
 	}
 
 	if err := ensureWeChatReady(setupFlags.root, setupFlags.pid, 90*time.Second); err != nil {
 		fail("%v", err)
 	}
 
-	if existingReady {
+	if !needKeys {
 		fmt.Println("[INFO] Extracting image_key and updating config...")
 		res, err := runImageKeyCaptured(setupFlags)
 		if err != nil {
@@ -649,17 +676,7 @@ func runBootstrap(args []string) {
 		return
 	}
 
-	strategy := selectBootstrapKeyStrategy(wechatAppPath)
-	if strategy.Version.ShortVersion != "" {
-		fmt.Printf("[INFO] WeChat version: %s", strategy.Version.ShortVersion)
-		if strategy.Version.Build != "" {
-			fmt.Printf(" (build %s)", strategy.Version.Build)
-		}
-		fmt.Println("")
-	} else if strategy.Version.Err != nil {
-		fmt.Printf("[INFO] WeChat version: unknown (%v)\n", strategy.Version.Err)
-	}
-	fmt.Printf("[INFO] Key strategy: %s (%s)\n", strategy.Name, strategy.Reason)
+	printBootstrapStrategy(strategy)
 	fmt.Printf("[INFO] Extracting keys and writing config (initial scan timeout %s; PBKDF fallback %s)...\n",
 		formatDuration(strategy.ScanTimeout), formatDuration(pbkdfProbeTimeout()))
 	res, err := runSetupCaptured(setupFlags, strategy.ScanTimeout)
@@ -684,7 +701,38 @@ func runBootstrap(args []string) {
 			res = pbkdfRes
 		}
 	}
+	printBootstrapKeySummary(res, priorCfg)
+}
 
+// printBootstrapUserNotice tells the human, before anything pops up, what
+// bootstrap will do to their WeChat and what (little) they need to do.
+func printBootstrapUserNotice(needsAdminPassword bool) {
+	fmt.Println("")
+	fmt.Println("【请先看】wxkey 接下来会：")
+	if needsAdminPassword {
+		fmt.Println("  · 弹出一次 Mac 管理员密码框：输入开机密码即可，wxkey 会把它存进你的钥匙串，以后刷新不再询问。")
+	}
+	fmt.Println("  · 暂时退出你正在用的微信，然后弹出一个“影子微信”窗口。它用你本机数据的副本启动，不会改动你的聊天记录。")
+	fmt.Println("  · 影子微信窗口里通常什么都不用做：不用扫码、不用点击，保持它打开，几秒到一两分钟后会自动关闭。")
+	fmt.Println("  · 只有当它显示“进入微信”按钮或登录二维码时，才点“进入微信”并在手机上确认登录。")
+	fmt.Println("  · 结束后（成功或失败）你的微信会自动重新打开。")
+	fmt.Println("")
+}
+
+func printBootstrapStrategy(strategy bootstrapKeyStrategy) {
+	if strategy.Version.ShortVersion != "" {
+		fmt.Printf("[INFO] WeChat version: %s", strategy.Version.ShortVersion)
+		if strategy.Version.Build != "" {
+			fmt.Printf(" (build %s)", strategy.Version.Build)
+		}
+		fmt.Println("")
+	} else if strategy.Version.Err != nil {
+		fmt.Printf("[INFO] WeChat version: unknown (%v)\n", strategy.Version.Err)
+	}
+	fmt.Printf("[INFO] Key strategy: %s (%s)\n", strategy.Name, strategy.Reason)
+}
+
+func printBootstrapKeySummary(res *setupOutput, prior wxcliConfig) {
 	fmt.Println("[OK]   key config written")
 	fmt.Printf("       config: %s\n", res.ConfigPath)
 	fmt.Printf("       wxid: %s\n", res.WxID)
@@ -692,6 +740,25 @@ func runBootstrap(args []string) {
 	fmt.Printf("       keys: %d\n", len(res.Results))
 	fmt.Println("")
 	fmt.Println("Done. Start wechat-cli now; future key refresh uses stored sudo while SIP stays enabled.")
+	if prior.KeyStore == "keychain" {
+		fmt.Println("[下一步] 你的 wechat-cli 原本把 key 存在 macOS 钥匙串里；本次新 key 写进了 config.json。")
+		fmt.Println("         请运行 `wechat-cli keychain migrate` 把它们迁回钥匙串（会自动备份旧配置）。")
+	}
+}
+
+// refreshImageKeyBestEffort derives image_key (kvcomm cache first) after a
+// PBKDF bootstrap; a failure only warns because DB keys are already saved.
+func refreshImageKeyBestEffort(f scanFlags, cfgPath string) {
+	res, err := runImageKeyCaptured(f)
+	if err != nil || res.ImageKey == nil || res.ImageKey.Key == "" {
+		fmt.Fprintf(os.Stderr, "[WARN] image_key not refreshed (%v); open one image in WeChat, then rerun `wxkey bootstrap`.\n", err)
+		return
+	}
+	if err := writeImageKeyToConfig(cfgPath, res.ImageKey.Key, res.ImageKey.XORKey); err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] write image_key config: %v\n", err)
+		return
+	}
+	fmt.Println("[OK]   image_key config updated")
 }
 
 // --- helpers ---
@@ -1160,31 +1227,57 @@ func rejectRootDirectorySymlinks(root *os.Root, rel string) error {
 	return nil
 }
 
-func prepareShadowWeChat() (int, func(), error) {
+func prepareShadowWeChat(root string) (int, func(), error) {
 	shadowPath, hadWeChatRunning, err := prepareShadowWeChatCopy()
 	if err != nil {
 		return 0, nil, err
 	}
+	restoreOriginal := atFail(func() {
+		if hadWeChatRunning {
+			reopenOriginalWeChatAfterPBKDF()
+		}
+	})
+	if root == "" {
+		if r, err := pickAccountRoot(); err == nil {
+			root = r
+		}
+	}
+	home, removeHome, err := prepareShadowHome(root)
+	if err != nil {
+		restoreOriginal()
+		return 0, nil, fmt.Errorf("prepare shadow WeChat home: %w", err)
+	}
+	removeHome = atFail(removeHome)
 
 	fmt.Println("[INFO] Opening wechat-cli WeChat shadow copy...")
-	if err := exec.Command("/usr/bin/open", "-n", shadowPath).Run(); err != nil {
+	openArgs := []string{"-n"}
+	for _, kv := range shadowHomeEnv(home) {
+		openArgs = append(openArgs, "--env", kv)
+	}
+	openArgs = append(openArgs, shadowPath)
+	if err := exec.Command("/usr/bin/open", openArgs...).Run(); err != nil {
+		removeHome()
+		restoreOriginal()
 		return 0, nil, fmt.Errorf("open shadow WeChat: %w", err)
 	}
 	pid, err := waitForWeChatPIDUnderApp(shadowPath, 90*time.Second)
 	if err != nil {
+		removeHome()
+		restoreOriginal()
 		return 0, nil, err
 	}
 
-	cleanup := func() {
+	cleanup := atFail(func() {
 		if envTrue("WXKEY_KEEP_SHADOW_WECHAT") {
 			return
 		}
 		_ = exec.Command("/bin/kill", "-TERM", strconv.Itoa(pid)).Run()
 		time.Sleep(1 * time.Second)
-		if hadWeChatRunning && !envTrue("WXKEY_NO_REOPEN_ORIGINAL_WECHAT") {
-			_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
-		}
-	}
+		killWeChatProcessesUnderApp(shadowPath, syscall.SIGKILL)
+		clearStaleLaunchServicesEntries(shadowPath)
+		removeHome()
+		restoreOriginal()
+	})
 	return pid, cleanup, nil
 }
 
@@ -1538,10 +1631,24 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
 		return nil, err
 	}
 	hadWeChatRunning := stopWeChatForPBKDF(target.AppPath)
-	if hadWeChatRunning {
-		defer reopenOriginalWeChatAfterPBKDF()
-	}
+	restoreOriginal := atFail(func() {
+		killWeChatProcessesUnderApp(target.AppPath, syscall.SIGKILL)
+		if hadWeChatRunning {
+			reopenOriginalWeChatAfterPBKDF()
+		}
+	})
+	defer restoreOriginal()
 	time.Sleep(1 * time.Second)
+
+	childHome := ""
+	if target.Mode == "shadow" {
+		home, removeHome, err := prepareShadowHome(root)
+		if err != nil {
+			return nil, fmt.Errorf("prepare shadow WeChat home: %w", err)
+		}
+		defer atFail(removeHome)()
+		childHome = home
+	}
 
 	tmpDir, err := os.MkdirTemp("", "wxkey-pbkdf-")
 	if err != nil {
@@ -1575,6 +1682,9 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
 	if envTrue("WXKEY_PBKDF_EARLY_STOP") {
 		args = append(args, "--early-stop")
 	}
+	if childHome != "" {
+		args = append(args, "--child-home", childHome)
+	}
 	logf(f.quiet, "[wxkey] PBKDF fallback: launching %s WeChat under LLDB (timeout %s)\n", target.Mode, timeout.Round(time.Second))
 	commandTimeout := time.Duration(0)
 	if timeout > 0 {
@@ -1582,6 +1692,9 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
 	}
 	_, stderr, runErr := runChildCaptured(commandTimeout, "/usr/bin/env", args...)
 	killWeChatProcessesUnderApp(target.AppPath, syscall.SIGKILL)
+	if target.Mode == "shadow" {
+		clearStaleLaunchServicesEntries(target.AppPath)
+	}
 
 	probe, parseErr := readPBKDFProbeFile(outPath)
 	if parseErr != nil {
@@ -1640,7 +1753,7 @@ func pbkdfProbeTargetForBootstrap() (pbkdfProbeTarget, error) {
 
 	shadowPath := shadowWeChatPath()
 	shadowExe := filepath.Join(shadowPath, "Contents", "MacOS", "WeChat")
-	if _, err := os.Stat(shadowExe); err != nil {
+	if _, err := os.Stat(shadowExe); err != nil || shadowWeChatStale(shadowPath) {
 		var prepErr error
 		shadowPath, _, prepErr = prepareShadowWeChatCopy()
 		if prepErr != nil {
@@ -1649,6 +1762,17 @@ func pbkdfProbeTargetForBootstrap() (pbkdfProbeTarget, error) {
 		shadowExe = filepath.Join(shadowPath, "Contents", "MacOS", "WeChat")
 	}
 	return pbkdfProbeTarget{AppPath: shadowPath, ExePath: shadowExe, Mode: "shadow"}, nil
+}
+
+// shadowWeChatStale reports whether the shadow copy was built from a different
+// WeChat build than the installed one (WeChat auto-updates in place).
+func shadowWeChatStale(shadowPath string) bool {
+	installed := detectWeChatVersion(wechatAppPath)
+	shadow := detectWeChatVersion(shadowPath)
+	if installed.Err != nil || shadow.Err != nil {
+		return installed.Err == nil
+	}
+	return installed.ShortVersion != shadow.ShortVersion || installed.Build != shadow.Build
 }
 
 func stopWeChatForPBKDF(targetAppPath string) bool {
@@ -1693,7 +1817,8 @@ func pbkdfNoKeyDiagnosis(probe pbkdfProbeFile, root string) string {
 		probe.DBCount, probe.UniqueSalts, stops, hits, kdfHits, macHits, root)
 	switch {
 	case hits == 0:
-		return summary + "\nNo PBKDF calls were observed. Keep the LLDB-launched WeChat window logged in, open one normal chat so WeChat decrypts DBs, then rerun `wxkey bootstrap`. On slow machines use `WXKEY_PBKDF_PROBE_TIMEOUT=5m wxkey bootstrap`."
+		return summary + "\n影子微信没有登录成功，所以没有解密数据库。请重跑 `wxkey bootstrap`，在弹出的影子微信窗口点“进入微信”，并在手机上确认登录。" +
+			"\nNo PBKDF calls were observed. Keep the LLDB-launched WeChat window logged in, open one normal chat so WeChat decrypts DBs, then rerun `wxkey bootstrap`. On slow machines use `WXKEY_PBKDF_PROBE_TIMEOUT=5m wxkey bootstrap`."
 	case kdfHits == 0 && macHits == 0:
 		return summary + "\nPBKDF ran, but none of its salts matched this DB root. This usually means wxkey selected the wrong WeChat account directory; pass the correct `--root .../xwechat_files/<wxid>` or set WECHAT_CLI_DB_ROOT."
 	default:
@@ -1770,15 +1895,61 @@ func pbkdfProbeResults(root string, probe pbkdfProbeFile, dbs []dbfiles.DB) []sc
 	return results
 }
 
+// killWeChatProcessesUnderApp signals every process whose executable lives
+// inside appPath: the main WeChat plus its helpers (crashpad_handler,
+// WeChatAppEx*, XPlayer, WeApp...), which otherwise outlive a killed shadow.
+// clearStaleLaunchServicesEntries drops LaunchServices records left behind by
+// a shadow WeChat that died without telling LaunchServices. The shadow shares
+// the bundle id com.tencent.xinWeChat, and while such a record exists the
+// real WeChat sees "another instance" at launch and exits with status 255.
+func clearStaleLaunchServicesEntries(appPath string) {
+	out, err := exec.Command("/usr/bin/lsappinfo", "find", "bundlepath="+appPath).Output()
+	if err != nil {
+		return
+	}
+	for _, asn := range lsASNs(string(out)) {
+		_ = exec.Command("/usr/bin/lsappinfo", "quit", "-asn", asn, "-exitstatus", "0").Run()
+	}
+}
+
+var lsASNPattern = regexp.MustCompile(`ASN:(0x[0-9a-fA-F]+-0x[0-9a-fA-F]+)`)
+
+func lsASNs(out string) []string {
+	var asns []string
+	for _, m := range lsASNPattern.FindAllStringSubmatch(out, -1) {
+		asns = append(asns, "ASN:"+m[1]+":")
+	}
+	return asns
+}
+
 func killWeChatProcessesUnderApp(appPath string, sig syscall.Signal) {
-	pids, _ := wechatPIDs()
-	for _, pid := range pids {
-		procPath, err := commandPathForPID(pid)
-		if err != nil || !pathInsideApp(procPath, appPath) {
+	out, err := exec.Command("/bin/ps", "-axo", "pid=,comm=").Output()
+	if err != nil {
+		return
+	}
+	for _, pid := range pidsUnderApp(string(out), appPath) {
+		if pid != os.Getpid() {
+			_ = syscall.Kill(pid, sig)
+		}
+	}
+}
+
+func pidsUnderApp(psOutput, appPath string) []int {
+	var pids []int
+	for _, line := range strings.Split(psOutput, "\n") {
+		fields := strings.SplitN(strings.TrimSpace(line), " ", 2)
+		if len(fields) != 2 {
 			continue
 		}
-		_ = syscall.Kill(pid, sig)
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 {
+			continue
+		}
+		if pathInsideApp(strings.TrimSpace(fields[1]), appPath) {
+			pids = append(pids, pid)
+		}
 	}
+	return pids
 }
 
 const pbkdfProbePython = `
@@ -1807,7 +1978,9 @@ def build_db_maps(root):
     salt_to_db = {}
     macsalt_to_db = {}
     db_storage = os.path.join(root, "db_storage")
-    for dirpath, _, names in os.walk(db_storage):
+    for dirpath, dirnames, names in os.walk(db_storage):
+        # Skip WCDB repair backups (<name>.db.factory/<ts>/<name>.db); see dbfiles.Collect.
+        dirnames[:] = [d for d in dirnames if not d.endswith(".factory")]
         for name in names:
             if not name.endswith(".db") or name.endswith("-wal") or name.endswith("-shm"):
                 continue
@@ -1871,8 +2044,12 @@ def write_result(path, dbs, salt_to_db, found, seen, counters):
         json.dump(result, f, indent=2)
     os.replace(tmp, path)
 
-def should_stop_early(found, seen, salt_to_db, early_stop):
+def should_stop_early(found, seen, salt_to_db, early_stop, counters):
     if len(seen) >= len(salt_to_db):
+        return True
+    if counters.get("master_key"):
+        # Every key derivable from the master password is already derived;
+        # waiting for more PBKDF calls cannot add coverage.
         return True
     if not early_stop:
         return False
@@ -1889,6 +2066,25 @@ def should_stop_early(found, seen, salt_to_db, early_stop):
         target = 1
     return bool(found) and len(seen) >= target
 
+def derive_all_from_master(password, prf, salt_to_db, found, seen, counters):
+    # WeChat 4.x derives every DB key from one per-account 32-byte password:
+    # enc_key = PBKDF2-HMAC-SHA512(password, db_salt, 256000). Once one call
+    # verifies, derive the rest offline, including DBs WeChat never opens.
+    changed = False
+    for salt, records in salt_to_db.items():
+        pending = [db for db in records if db["rel"] not in found]
+        if not pending:
+            continue
+        enc_key = hashlib.pbkdf2_hmac("sha512", password, salt, KDF_ITER, KEY_SIZE)
+        for db in pending:
+            if verify_enc_key(enc_key, db["page1"]):
+                found[db["rel"]] = {"key_hex": enc_key.hex(), "salt_hex": db["salt"].hex(), "mode": "password", "rounds": KDF_ITER, "prf": prf}
+                seen.add(db["salt"])
+                changed = True
+    counters["found"] = len(found)
+    counters["master_key"] = 1
+    return changed
+
 def handle_hit(process, frame, salt_to_db, macsalt_to_db, found, seen, counters):
     password_ptr, password_len, salt_ptr, salt_len, prf, rounds = pbkdf_args(process, frame)
     counters["hits"] += 1
@@ -1904,14 +2100,19 @@ def handle_hit(process, frame, salt_to_db, macsalt_to_db, found, seen, counters)
             return False
         counters["kdf_256k_salt_hits"] += 1
         enc_key = hashlib.pbkdf2_hmac("sha512", password, salt_arg, KDF_ITER, KEY_SIZE)
+        verified = False
         for db in salt_to_db[salt_arg]:
+            if not verify_enc_key(enc_key, db["page1"]):
+                continue
+            verified = True
             if db["rel"] in found:
                 continue
-            if verify_enc_key(enc_key, db["page1"]):
-                found[db["rel"]] = {"key_hex": enc_key.hex(), "salt_hex": db["salt"].hex(), "mode": "password", "rounds": rounds, "prf": prf}
-                seen.add(db["salt"])
-                counters["found"] = len(found)
-                changed = True
+            found[db["rel"]] = {"key_hex": enc_key.hex(), "salt_hex": db["salt"].hex(), "mode": "password", "rounds": rounds, "prf": prf}
+            seen.add(db["salt"])
+            counters["found"] = len(found)
+            changed = True
+        if verified and not counters.get("master_key") and password_len == KEY_SIZE:
+            changed = derive_all_from_master(password, prf, salt_to_db, found, seen, counters) or changed
         return changed
     if rounds == 2 and salt_arg in macsalt_to_db and password_len == KEY_SIZE:
         enc_key = read_mem(process, password_ptr, KEY_SIZE)
@@ -1935,50 +2136,71 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--timeout", type=float, default=90)
     ap.add_argument("--early-stop", action="store_true")
+    ap.add_argument("--child-home", default="")
     args = ap.parse_args()
     dbs, salt_to_db, macsalt_to_db = build_db_maps(args.root)
     debugger = lldb.SBDebugger.Create()
-    debugger.SetAsync(False)
+    # Async mode: a synchronous Continue() blocks until the next stop, so a
+    # shadow that never reaches PBKDF (e.g. waiting on its login screen) would
+    # hang past --timeout and get SIGKILLed while still traced, leaving a stale
+    # LaunchServices entry that stops the user's real WeChat from launching.
+    debugger.SetAsync(True)
     target = debugger.CreateTarget(args.exe)
     if not target.IsValid():
         raise RuntimeError("invalid target")
     bp = target.BreakpointCreateByName("CCKeyDerivationPBKDF")
     if not bp.IsValid() or bp.GetNumLocations() == 0:
         raise RuntimeError("CCKeyDerivationPBKDF breakpoint did not resolve")
-    process = target.Launch(lldb.SBLaunchInfo([]), lldb.SBError())
+    launch_info = lldb.SBLaunchInfo([])
+    if args.child_home:
+        # Run the shadow on a cloned home: macOS App Data protection blocks it
+        # from the official WeChat container. CFFIXED_USER_HOME drives
+        # NSHomeDirectory(); HOME covers POSIX callers.
+        launch_info.SetEnvironmentEntries(["HOME=" + args.child_home, "CFFIXED_USER_HOME=" + args.child_home], True)
+    listener = debugger.GetListener()
+    process = target.Launch(launch_info, lldb.SBError())
     if not process.IsValid():
         raise RuntimeError("launch failed")
     found = {}
     seen = set()
-    counters = {"hits": 0, "kdf_256k_salt_hits": 0, "mac_kdf_salt_hits": 0, "stops": 0, "found": 0, "early_stop": 0}
+    counters = {"hits": 0, "kdf_256k_salt_hits": 0, "mac_kdf_salt_hits": 0, "stops": 0, "found": 0, "early_stop": 0, "master_key": 0, "exited": 0}
     deadline = time.time() + args.timeout
+    event = lldb.SBEvent()
     try:
         while time.time() < deadline:
-            state = process.GetState()
-            if state == lldb.eStateStopped:
-                counters["stops"] += 1
-                changed = False
-                for i in range(process.GetNumThreads()):
-                    thread = process.GetThreadAtIndex(i)
-                    if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
-                        continue
-                    changed = handle_hit(process, thread.GetFrameAtIndex(0), salt_to_db, macsalt_to_db, found, seen, counters) or changed
-                if changed:
-                    write_result(args.out, dbs, salt_to_db, found, seen, counters)
-                if should_stop_early(found, seen, salt_to_db, args.early_stop):
-                    counters["early_stop"] = 1
-                    break
-            elif state in (lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached):
+            if not listener.WaitForEvent(1, event):
+                continue
+            if not lldb.SBProcess.EventIsProcessEvent(event):
+                continue
+            state = lldb.SBProcess.GetStateFromEvent(event)
+            if state in (lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached):
+                counters["exited"] = 1
+                break
+            if state != lldb.eStateStopped or lldb.SBProcess.GetRestartedFromEvent(event):
+                continue
+            counters["stops"] += 1
+            changed = False
+            for i in range(process.GetNumThreads()):
+                thread = process.GetThreadAtIndex(i)
+                if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
+                    continue
+                changed = handle_hit(process, thread.GetFrameAtIndex(0), salt_to_db, macsalt_to_db, found, seen, counters) or changed
+            if changed:
+                write_result(args.out, dbs, salt_to_db, found, seen, counters)
+            if should_stop_early(found, seen, salt_to_db, args.early_stop, counters):
+                counters["early_stop"] = 1
                 break
             process.Continue()
     finally:
         write_result(args.out, dbs, salt_to_db, found, seen, counters)
+        # Kill through the debugger so debugserver reaps the shadow and macOS
+        # sees a normal exit; the shadow has nothing left to do either way.
         try:
-            process.Stop()
-        except Exception:
-            pass
-        try:
-            process.Detach()
+            if process.GetState() not in (lldb.eStateExited, lldb.eStateDetached):
+                process.Kill()
+                end = time.time() + 5
+                while time.time() < end and process.GetState() != lldb.eStateExited:
+                    listener.WaitForEvent(1, event)
         except Exception:
             pass
 
@@ -2228,8 +2450,25 @@ func writeJSON(v any) {
 	fmt.Println(string(data))
 }
 
+// failCleanups run (newest first) when fail() exits, so an aborted bootstrap
+// still stops the shadow WeChat, removes its cloned home and reopens the
+// user's WeChat. Deferred cleanups do not run on os.Exit.
+var failCleanups []func()
+
+// atFail registers fn for fail() and returns an idempotent wrapper that the
+// caller should also run (or defer) on its normal path.
+func atFail(fn func()) func() {
+	var once sync.Once
+	wrapped := func() { once.Do(fn) }
+	failCleanups = append(failCleanups, wrapped)
+	return wrapped
+}
+
 func fail(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "[wxkey] ERROR: "+format+"\n", args...)
+	for i := len(failCleanups) - 1; i >= 0; i-- {
+		failCleanups[i]()
+	}
 	os.Exit(1)
 }
 

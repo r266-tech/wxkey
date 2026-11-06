@@ -21,7 +21,7 @@ type DB struct {
 }
 
 // Collect walks root and returns every regular .db file >= 4096 bytes
-// (skipping -wal / -shm sidecars). Returns the DB slice plus a salt→[]int
+// (skipping -wal / -shm sidecars and WCDB *.factory repair backups). Returns the DB slice plus a salt→[]int
 // map so callers can look up which DBs share a salt.
 func Collect(root string) ([]DB, map[string][]int, error) {
 	if root == "" {
@@ -43,6 +43,12 @@ func Collect(root string) ([]DB, map[string][]int, error) {
 			return nil // best effort: skip unreadable dirs/files
 		}
 		if d.IsDir() {
+			// <name>.db.factory/<timestamp>/<name>.db are WCDB repair backups:
+			// not live DBs, often encrypted under an older key, never read by
+			// wechat-cli. Counting them leaves coverage permanently "partial".
+			if path != root && strings.HasSuffix(d.Name(), ".factory") {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		name := d.Name()
