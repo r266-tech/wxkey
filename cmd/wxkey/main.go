@@ -747,8 +747,9 @@ func printBootstrapKeySummary(res *setupOutput, prior wxcliConfig) {
 	fmt.Println("")
 	fmt.Println("Done. Start wechat-cli now; future key refresh uses stored sudo while SIP stays enabled.")
 	if prior.KeyStore == "keychain" {
-		fmt.Println("[下一步] 你的 wechat-cli 原本把 key 存在 macOS 钥匙串里；本次新 key 写进了 config.json。")
-		fmt.Println("         请运行 `wechat-cli keychain migrate` 把它们迁回钥匙串（会自动备份旧配置）。")
+		fmt.Println("[INFO] 你的 wechat-cli 原本把 key 存在 macOS 钥匙串里；本次新 key 先写进了 config.json。")
+		fmt.Println("       wechat-cli 2.0.3+ 下一次读取会自动把它们存回钥匙串，不需要额外操作；")
+		fmt.Println("       更早的版本请运行 `wechat-cli keychain migrate`。")
 	}
 }
 
