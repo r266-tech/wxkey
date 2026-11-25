@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -546,5 +547,38 @@ func TestDeriveImageKeyFromKVCode(t *testing.T) {
 	want := fmt.Sprintf("%x", sum)[:aes.BlockSize]
 	if got != want {
 		t.Fatalf("deriveImageKeyFromKVCode = %q, want %q", got, want)
+	}
+}
+
+func TestSudoPasswordRejectedOnlyForPasswordFailures(t *testing.T) {
+	for _, msg := range []string{"exit status 1: Sorry, try again.", "exit status 1: sudo: 1 incorrect password attempt"} {
+		if !isSudoPasswordRejected(errors.New(msg)) {
+			t.Fatalf("expected %q to count as a rejected password", msg)
+		}
+	}
+	for _, msg := range []string{"exit status 1: admin is not in the sudoers file", "exit status 1\n[wxkey] ERROR: PBKDF fallback found no keys", ""} {
+		if isSudoPasswordRejected(errors.New(msg)) {
+			t.Fatalf("%q must not trigger a new password prompt", msg)
+		}
+	}
+}
+
+func TestElevateFailHintDoesNotBlamePasswordWhenChildFailed(t *testing.T) {
+	hint := buildElevateFailHint(errors.New("exit status 1\n[wxkey] ERROR: scan: task_for_pid pid=1 kr=5"), errors.New("task_for_pid pid=1 kr=5"))
+	if strings.Contains(hint, "enter the Mac admin password") || !strings.Contains(hint, "Do not ask the user for the password again") {
+		t.Fatalf("hint blames the password for a child failure:\n%s", hint)
+	}
+	hint = buildElevateFailHint(errors.New("exit status 1: Sorry, try again."), errors.New("task_for_pid pid=1 kr=5"))
+	if !strings.Contains(hint, "admin password") {
+		t.Fatalf("hint should ask for the password after sudo rejected it:\n%s", hint)
+	}
+}
+
+func TestSudoPromptTextIsChineseAndExplainsReprompt(t *testing.T) {
+	if !strings.Contains(sudoPromptText("first"), "只问这一次") || !strings.Contains(sudoPromptText("rejected"), "已失效") {
+		t.Fatal("prompt text must say it asks once and explain a re-prompt")
+	}
+	if strings.ContainsAny(sudoPromptText("first")+sudoPromptText("rejected"), `"\`) {
+		t.Fatal("prompt text must not break the AppleScript string literal")
 	}
 }

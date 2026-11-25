@@ -261,6 +261,9 @@ func runScan(args []string, doSetup bool) {
 				stats.Elapsed.Round(time.Second), len(results), len(saltIdx))
 		} else {
 			// Auto-elevate on permission failure.
+			if isPermissionErr(err) && !pidAlive(pid) {
+				fail("WeChat process %d exited before wxkey could read it (not a permission problem). Make sure WeChat opens and stays logged in, then rerun `wxkey bootstrap`.", pid)
+			}
 			if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
 				logf(f.quiet, "[wxkey] task_for_pid denied; re-launching via stored sudo credential...\n")
 				if reErr := reExecElevated(); reErr != nil {
@@ -528,6 +531,9 @@ func runImageKey(args []string) {
 	}
 	img, err := scanImageKey(pid, root, f.quiet)
 	if err != nil {
+		if isPermissionErr(err) && !pidAlive(pid) {
+			fail("WeChat process %d exited before wxkey could read it (not a permission problem). Make sure WeChat opens and stays logged in, then rerun `wxkey bootstrap`.", pid)
+		}
 		if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
 			logf(f.quiet, "[wxkey] task_for_pid denied; re-launching via stored sudo credential...\n")
 			if reErr := reExecElevated(); reErr != nil {
@@ -2523,12 +2529,23 @@ func ensureStoredSudoPassword() error {
 	if os.Geteuid() == 0 {
 		return nil
 	}
+	reason := "first"
 	if pw, err := readStoredSudoPassword(); err == nil {
-		if err := sudoValidatePassword(pw); err == nil {
+		verr := sudoValidatePassword(pw)
+		if verr == nil {
 			return nil
 		}
+		if !isSudoPasswordRejected(verr) {
+			// The stored password may be fine; sudo failed for another reason.
+			// Asking the user again would not help, so report instead of prompting.
+			return fmt.Errorf("stored sudo credential could not be verified (not asking for the password again): %v", verr)
+		}
+		reason = "rejected"
+		fmt.Fprintf(os.Stderr, "[wxkey] stored admin password was rejected by sudo (%s); asking once for the current one.\n", strings.TrimSpace(verr.Error()))
+	} else {
+		fmt.Fprintf(os.Stderr, "[wxkey] no stored admin password (%v); asking once.\n", err)
 	}
-	pw, err := promptSudoPasswordGUI()
+	pw, err := promptSudoPasswordGUI(reason)
 	if err != nil {
 		return err
 	}
@@ -2582,8 +2599,28 @@ func securityArgQuote(s string) string {
 	return `"` + s + `"`
 }
 
-func promptSudoPasswordGUI() (string, error) {
-	script := `display dialog "wechat-cli needs your Mac admin password once. It will be stored in your macOS Keychain so future WeChat key refreshes can run unattended without disabling SIP." default answer "" with hidden answer buttons {"Cancel", "Store"} default button "Store" cancel button "Cancel" with title "wechat-cli setup"`
+// isSudoPasswordRejected reports whether sudo refused the password itself, as
+// opposed to failing for an unrelated reason (no sudo rights, PAM error, ...).
+// Only a rejected password justifies asking the user again.
+func isSudoPasswordRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "incorrect password") ||
+		strings.Contains(msg, "sorry, try again") ||
+		strings.Contains(msg, "password is required")
+}
+
+func sudoPromptText(reason string) string {
+	if reason == "rejected" {
+		return "钥匙串里保存的 Mac 开机密码已失效（可能改过开机密码）。请重新输入一次当前的开机密码，之后刷新微信密钥不再询问。"
+	}
+	return "wechat-cli 需要你的 Mac 开机密码，只问这一次。它会保存在你的钥匙串里，之后刷新微信密钥不再询问，也不需要关闭 SIP。"
+}
+
+func promptSudoPasswordGUI(reason string) (string, error) {
+	script := `display dialog "` + sudoPromptText(reason) + `" default answer "" with hidden answer buttons {"取消", "保存"} default button "保存" cancel button "取消" with title "wechat-cli 设置"`
 	cmd := exec.Command("/usr/bin/osascript", "-e", script, "-e", "text returned of result")
 	out, err := cmd.Output()
 	if err != nil {
@@ -2627,6 +2664,13 @@ func buildElevateFailHint(reErr, origErr error) string {
 		return b.String()
 	}
 	var b strings.Builder
+	if !isSudoPasswordRejected(reErr) {
+		fmt.Fprintf(&b, "elevated wxkey run failed: %v\n", reErr)
+		fmt.Fprintln(&b, "       The stored admin password worked; the failure is in the elevated run")
+		fmt.Fprintln(&b, "       itself (see the log above). Do not ask the user for the password again.")
+		fmt.Fprintln(&b, "       Rerun `wxkey bootstrap`; it prepares the shadow WeChat route automatically.")
+		return b.String()
+	}
 	fmt.Fprintf(&b, "auto-elevate via stored sudo credential failed: %v\n", reErr)
 	fmt.Fprintf(&b, "       original permission error: %v\n", origErr)
 	fmt.Fprintln(&b, "")
@@ -2768,7 +2812,7 @@ func invokingUserCommandEnv(env []string) []string {
 
 func printPermissionAdvice(quiet bool, original error) {
 	if quiet {
-		fmt.Fprintln(os.Stderr, "wxkey: task_for_pid denied. Run `wxkey doctor` for details or `wxkey resign-wechat` to use the no-SIP setup route.")
+		fmt.Fprintln(os.Stderr, "wxkey: task_for_pid denied. Run `wxkey bootstrap`; it prepares the no-SIP shadow WeChat route automatically.")
 		return
 	}
 
@@ -2797,10 +2841,9 @@ func printPermissionAdvice(quiet bool, original error) {
 	} else if sig.AdHoc {
 		fmt.Fprintln(os.Stderr, "       WeChat 签名: ad-hoc, 已是推荐状态. 请先跑 `wxkey bootstrap` 存储 sudo 凭据")
 	} else if sig.Runtime {
-		fmt.Fprintln(os.Stderr, "       WeChat 签名: 官方 Hardened Runtime. 推荐执行一次:")
-		fmt.Fprintln(os.Stderr, "         ./wxkey resign-wechat")
-		fmt.Fprintln(os.Stderr, "       然后等 WeChat 完全登录并打开一个聊天, 再跑:")
-		fmt.Fprintln(os.Stderr, "         wxkey setup")
+		fmt.Fprintln(os.Stderr, "       WeChat 签名: 官方 Hardened Runtime. 运行一次:")
+		fmt.Fprintln(os.Stderr, "         wxkey bootstrap")
+		fmt.Fprintln(os.Stderr, "       它会自动准备影子微信取 key, 不改动原版微信.")
 	} else {
 		fmt.Fprintln(os.Stderr, "       WeChat 签名: 未识别. 可先跑 `wxkey doctor` 查看详情.")
 	}
