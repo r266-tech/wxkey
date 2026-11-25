@@ -1616,6 +1616,9 @@ type pbkdfProbeTarget struct {
 	AppPath string
 	ExePath string
 	Mode    string
+	// StoppedWeChat is set when preparing the shadow copy quit the user's
+	// WeChat, so the caller still reopens it afterwards.
+	StoppedWeChat bool
 }
 
 func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
@@ -1637,7 +1640,7 @@ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
 	if err != nil {
 		return nil, err
 	}
-	hadWeChatRunning := stopWeChatForPBKDF(target.AppPath)
+	hadWeChatRunning := stopWeChatForPBKDF(target.AppPath) || target.StoppedWeChat
 	restoreOriginal := atFail(func() {
 		killWeChatProcessesUnderApp(target.AppPath, syscall.SIGKILL)
 		if hadWeChatRunning {
@@ -1760,15 +1763,22 @@ func pbkdfProbeTargetForBootstrap() (pbkdfProbeTarget, error) {
 
 	shadowPath := shadowWeChatPath()
 	shadowExe := filepath.Join(shadowPath, "Contents", "MacOS", "WeChat")
+	stopped := false
 	if _, err := os.Stat(shadowExe); err != nil || shadowWeChatStale(shadowPath) {
+		// Preparing the copy quits the user's WeChat; report that so it is
+		// reopened. Dropping it left WeChat closed after a first install or
+		// a WeChat update.
 		var prepErr error
-		shadowPath, _, prepErr = prepareShadowWeChatCopy()
+		shadowPath, stopped, prepErr = prepareShadowWeChatCopy()
 		if prepErr != nil {
+			if stopped {
+				reopenOriginalWeChatAfterPBKDF()
+			}
 			return pbkdfProbeTarget{}, prepErr
 		}
 		shadowExe = filepath.Join(shadowPath, "Contents", "MacOS", "WeChat")
 	}
-	return pbkdfProbeTarget{AppPath: shadowPath, ExePath: shadowExe, Mode: "shadow"}, nil
+	return pbkdfProbeTarget{AppPath: shadowPath, ExePath: shadowExe, Mode: "shadow", StoppedWeChat: stopped}, nil
 }
 
 // shadowWeChatStale reports whether the shadow copy was built from a different
